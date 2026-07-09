@@ -1,0 +1,3437 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SLERB_HOME="${SLERB_HOME:-$HOME/.slerb}"
+NODES_FILE="${SLERB_NODES_FILE:-$SLERB_HOME/nodes.tsv}"
+JOBS_FILE="${SLERB_JOBS_FILE:-$SLERB_HOME/jobs.tsv}"
+QUEUE_FILE="${SLERB_QUEUE_FILE:-$SLERB_HOME/queue.tsv}"
+QUEUE_DIR="${SLERB_QUEUE_DIR:-$SLERB_HOME/queue}"
+DISPATCH_LOCK_DIR="${SLERB_DISPATCH_LOCK_DIR:-$SLERB_HOME/dispatch.lock}"
+DISPATCH_INTERVAL="${SLERB_DISPATCH_INTERVAL:-30}"
+DEFAULT_ENV_FILE="${SLERB_ENV_FILE:-~/.slerb_env}"
+
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new)
+
+mkdir -p "$SLERB_HOME" "$QUEUE_DIR"
+touch "$JOBS_FILE" "$QUEUE_FILE"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_GREEN=$'\033[32m'
+  C_RED=$'\033[31m'
+  C_YELLOW=$'\033[33m'
+  C_BUSY=$'\033[38;5;178m'
+  C_RESERVED=$'\033[35m'
+  C_DIM=$'\033[2m'
+  C_RESET=$'\033[0m'
+else
+  C_GREEN=""
+  C_RED=""
+  C_YELLOW=""
+  C_BUSY=""
+  C_RESERVED=""
+  C_DIM=""
+  C_RESET=""
+fi
+
+usage() {
+  cat <<USAGE
+SLERB - SSH-Launched Execution Resource Broker
+Like SLURM, but with more duct tape.
+
+Usage:
+  slerb status
+  slerb validate [nodes.tsv]
+  slerb submit [options] <node|--auto> <input_dir> <run_script> <output_dir>
+  slerb jobs [n]
+  slerb queue
+  slerb dispatch [--interval SECONDS]
+  slerb arrays
+  slerb cancel <job_id>
+  slerb restart [--force] <job_id>
+  slerb reserve <node> [--gpu ID] [--reason TEXT]
+  slerb release <node> [--gpu ID]
+  slerb fetch <job_id>
+  slerb fetch --clean <job_id>
+  slerb fetch --all-done
+  slerb log <job_id>
+
+Submit options:
+  --keep              Keep remote job directory after successful fetch
+  --detach            Launch job and return immediately
+  --wait SECONDS      Wait/retry if no GPU is available instead of queueing
+  --gpu ID[,ID...]    Target specific physical GPU index(es) on a node
+  --ngpu N            Request any N free GPUs on the selected node
+  --array RANGE       Array range, for example 1-15 or 1,3,7-9
+  --exclude NODES     Exclude node(s) from --auto selection, comma-separated okay
+
+Queue behavior:
+  If a job cannot launch immediately because GPUs or nodes are unavailable,
+  it is queued automatically and a dispatcher is started if needed.
+  Queued jobs always launch detached when resources become available.
+
+Dispatch options:
+  --interval SECONDS  Poll interval while queued jobs remain, default: 30
+
+Reserve options:
+  --gpu ID            Reserve or release one physical GPU index
+  --reason TEXT       Record why a reservation exists
+
+Examples:
+  ./slerb status
+  ./slerb submit jill . ./submit.sh ./slerb-results
+  ./slerb submit --gpu 0,1 jill . ./submit.sh ./slerb-results
+  ./slerb submit --ngpu 2 --auto . ./submit.sh ./slerb-results
+  ./slerb queue
+  ./slerb dispatch
+  ./slerb submit --exclude atlantis --array 1-15 --wait 60 --auto . ./submit.sh ./slerb-results
+  ./slerb submit --exclude atlantis,odyssey --array 1-15 --wait 60 --auto . ./submit.sh ./slerb-results
+  ./slerb reserve explorer --gpu 1 --reason "local use"
+  ./slerb release explorer --gpu 1
+  ./slerb fetch --all-done
+USAGE
+}
+
+log_msg() {
+  printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*" >&2
+}
+
+err() {
+  printf 'ERROR: %s\n' "$*" >&2
+}
+
+trim() {
+  local s="$*"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+ssh_target() {
+  local user="$1" host="$2"
+  if [[ -n "$user" && "$user" != "-" ]]; then
+    printf '%s@%s' "$user" "$host"
+  else
+    printf '%s' "$host"
+  fi
+}
+
+remote_quote() {
+  printf "%q" "$1"
+}
+
+append_exclude() {
+  local current="$1"
+  local add="$2"
+
+  if [[ -z "$current" ]]; then
+    printf '%s' "$add"
+  else
+    printf '%s,%s' "$current" "$add"
+  fi
+}
+
+is_excluded_node() {
+  local node="$1"
+  local exclude_list="${2:-}"
+  local item
+
+  [[ -z "$exclude_list" ]] && return 1
+
+  IFS=',' read -ra _slerb_excluded_nodes <<< "$exclude_list"
+
+  for item in "${_slerb_excluded_nodes[@]}"; do
+    item="$(trim "$item")"
+    [[ -z "$item" ]] && continue
+
+    if [[ "$node" == "$item" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ensure_nodes_file() {
+  if [[ ! -f "$NODES_FILE" ]]; then
+    cat > "$NODES_FILE" <<EOF_NODES
+# name<TAB>user<TAB>host<TAB>env_file<TAB>tags
+# jill  $USER   localhost       ~/.slerb_env    gpu
+EOF_NODES
+    err "Created $NODES_FILE. Edit it and add nodes."
+    exit 1
+  fi
+}
+
+read_nodes() {
+  ensure_nodes_file
+
+  awk '
+    /^[[:space:]]*($|#)/ {next}
+
+    NF < 4 {
+      next
+    }
+
+    {
+      name=$1
+      user=$2
+      host=$3
+      env_file=$4
+      tags=$5
+
+      if (env_file == "") env_file="~/.slerb_env"
+      if (tags == "") tags="-"
+
+      printf "%s\t%s\t%s\t%s\t%s\n", name, user, host, env_file, tags
+    }
+  ' "$NODES_FILE"
+}
+
+get_node() {
+  local wanted="$1"
+  read_nodes | awk -F'\t' -v n="$wanted" '$1 == n {print; found=1; exit} END {if (!found) exit 1}'
+}
+
+kv_get() {
+  local key="$1"
+  awk -F'=' -v k="$key" '$1 == k {sub(k"=", ""); print; exit}'
+}
+
+mib_to_gib() {
+  local mib="${1:-0}"
+  awk -v m="$mib" 'BEGIN {printf "%.1f", (m+0)/1024}'
+}
+
+short_gpu_name() {
+  local name="$*"
+
+  name="${name#NVIDIA }"
+  name="${name#GeForce }"
+
+  case "$name" in
+    RTX\ PRO\ 6000*) printf 'RTX PRO 6000' ;;
+    RTX\ PRO\ 5000*) printf 'RTX PRO 5000' ;;
+    RTX\ PRO\ 4000*) printf 'RTX PRO 4000' ;;
+    RTX\ A6000*) printf 'RTX A6000' ;;
+    RTX\ A5000*) printf 'RTX A5000' ;;
+    RTX\ A4000*) printf 'RTX A4000' ;;
+    RTX\ 6000*) printf 'RTX 6000' ;;
+    RTX\ 5000*) printf 'RTX 5000' ;;
+    RTX\ 4090*) printf 'RTX 4090' ;;
+    RTX\ 4080*) printf 'RTX 4080' ;;
+    RTX\ 3090\ Ti*) printf 'RTX 3090 Ti' ;;
+    RTX\ 3090*) printf 'RTX 3090' ;;
+    RTX\ 3080\ Ti*) printf 'RTX 3080 Ti' ;;
+    RTX\ 3080*) printf 'RTX 3080' ;;
+    RTX\ 2080\ Ti*) printf 'RTX 2080 Ti' ;;
+    RTX\ 2080*) printf 'RTX 2080' ;;
+    *) printf '%s' "$name" ;;
+  esac
+}
+
+color_status() {
+  local s="$1"
+
+  case "$s" in
+    OK|DONE|free)
+      printf '%s%s%s' "$C_GREEN" "$s" "$C_RESET"
+      ;;
+    busy)
+      printf '%s%s%s' "$C_BUSY" "$s" "$C_RESET"
+      ;;
+    CANCELED)
+      printf '%s%s%s' "$C_YELLOW" "$s" "$C_RESET"
+      ;;
+    LOCKED|DOWN|FAIL|FAILED|ERROR|MISSING|LOST|KILLED)
+      printf '%s%s%s' "$C_RED" "$s" "$C_RESET"
+      ;;
+    RUNNING|DETACHED|STAGED|WAITING)
+      printf '%s%s%s' "$C_YELLOW" "$s" "$C_RESET"
+      ;;
+    *)
+      printf '%s' "$s"
+      ;;
+  esac
+}
+
+remote_probe_raw() {
+  local target="$1" env_file="$2"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- "$env_file" <<'REMOTE'
+set -u
+
+env_file="$1"
+
+if [[ -f "$env_file" ]]; then
+  source "$env_file" >/dev/null 2>&1 || true
+fi
+
+SLERB_SCRATCH="${SLERB_SCRATCH:-$HOME/slerb}"
+SLERB_JOBS_ROOT="${SLERB_JOBS_ROOT:-$SLERB_SCRATCH/jobs}"
+SLERB_LOCKS_ROOT="${SLERB_LOCKS_ROOT:-$SLERB_SCRATCH/locks}"
+
+mkdir -p "$SLERB_JOBS_ROOT" "$SLERB_LOCKS_ROOT" >/dev/null 2>&1 || true
+
+host="$(hostname -s 2>/dev/null || hostname)"
+cores="$(nproc 2>/dev/null || echo 1)"
+load1="$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)"
+mem_total="$(awk '/MemTotal:/ {printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+mem_avail="$(awk '/MemAvailable:/ {printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+mem_used="$(awk -v t="$mem_total" -v a="$mem_avail" 'BEGIN {printf "%.1f", t-a}')"
+scratch_free="$(df -BG "$SLERB_SCRATCH" 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4+0}' || echo 0)"
+cpu_free="$(awk -v c="$cores" -v l="$load1" 'BEGIN {f=int(c-l); if (f<0) f=0; print f}')"
+gpu_lock_count="$(find "$SLERB_LOCKS_ROOT" -maxdepth 1 -type d -name 'gpu-*.lock' 2>/dev/null | wc -l | tr -d ' ')"
+host_reserved="no"
+host_reason="-"
+
+if [[ -d "$SLERB_LOCKS_ROOT/host.lock" ]]; then
+  host_reserved="yes"
+
+  if [[ -f "$SLERB_LOCKS_ROOT/host.lock/info" ]]; then
+    host_reason="$(awk -F= '$1=="reason" {sub($1"=", ""); print; exit}' "$SLERB_LOCKS_ROOT/host.lock/info")"
+    host_reason="${host_reason:-reserved}"
+  else
+    host_reason="reserved"
+  fi
+fi
+
+host_reason="${host_reason//$'\t'/ }"
+lock_count="$gpu_lock_count"
+[[ "$host_reserved" == "yes" ]] && lock_count=$((lock_count + 1))
+
+printf 'META\thost=%s\tcores=%s\tcpu_free=%s\tload1=%s' \
+  "$host" "$cores" "$cpu_free" "$load1"
+printf '\tmem_used=%s\tmem_avail=%s\tmem_total=%s' \
+  "$mem_used" "$mem_avail" "$mem_total"
+printf '\tscratch=%s\tlocks=%s\tscratch_root=%s' \
+  "$scratch_free" "$lock_count" "$SLERB_SCRATCH"
+printf '\thost_reserved=%s\thost_reason=%s\n' \
+  "$host_reserved" "$host_reason"
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi \
+    --query-gpu=index,name,utilization.gpu,memory.used,memory.total \
+    --format=csv,noheader,nounits 2>/dev/null | \
+    while IFS=',' read -r idx name util mem_used_gpu mem_total_gpu; do
+      idx="$(echo "$idx" | xargs)"
+      name="$(echo "$name" | xargs)"
+      util="$(echo "$util" | xargs)"
+      mem_used_gpu="$(echo "$mem_used_gpu" | xargs)"
+      mem_total_gpu="$(echo "$mem_total_gpu" | xargs)"
+
+      lock_dir="$SLERB_LOCKS_ROOT/gpu-$idx.lock"
+      state="free"
+
+      if [[ "$host_reserved" == "yes" ]]; then
+        state="reserved"
+      elif [[ -d "$lock_dir" ]]; then
+        lock_type=""
+
+        if [[ -f "$lock_dir/info" ]]; then
+          lock_type="$(awk -F= '$1=="type" {print $2; exit}' "$lock_dir/info")"
+        fi
+
+        if [[ "$lock_type" == "reservation" ]]; then
+          state="reserved"
+        else
+          state="locked"
+        fi
+      elif [[ "${util:-0}" -gt 5 || "${mem_used_gpu:-0}" -gt 512 ]]; then
+        state="busy"
+      fi
+
+      printf 'GPU\tidx=%s\tstate=%s\tutil=%s\tmem_used=%s' \
+        "$idx" "$state" "$util" "$mem_used_gpu"
+      printf '\tmem_total=%s\tname=%s\n' "$mem_total_gpu" "$name"
+    done
+else
+  printf 'NOGPU\n'
+fi
+REMOTE
+}
+
+status_all() {
+  ensure_nodes_file
+
+  local sep c_node
+  sep="--------------------------------------------------------------------------------"
+  c_node=""
+  if [[ -n "${C_RESET:-}" ]]; then
+    c_node=$'\033[38;5;109m'
+  fi
+
+  printf '%-13s %-8s %-7s %-6s %-13s %-9s %-18s\n' \
+    "NODE" "STATUS" "CPU" "LOAD" "MEM" "SCRATCH" "TAGS"
+  printf '%s%s%s\n' "$C_DIM" "$sep" "$C_RESET"
+
+  while IFS=$'\t' read -r name user host env_file tags; do
+    [[ -z "${name:-}" ]] && continue
+
+    env_file="${env_file:-$DEFAULT_ENV_FILE}"
+    tags="${tags:--}"
+
+    local target out rc
+    target="$(ssh_target "$user" "$host")"
+
+    set +e
+    out="$(remote_probe_raw "$target" "$env_file" 2>&1)"
+    rc=$?
+    set -e
+
+    if [[ $rc -ne 0 ]]; then
+      printf '%s%-13.13s%s %s%-8.8s %-7.7s %-6.6s ' \
+        "$c_node" "$name" "$C_RESET" "$C_DIM" \
+        "DOWN" "-" "-"
+      printf '%-13.13s %-9.9s %-18.18s%s\n' \
+        "-" "-" "$tags" "$C_RESET"
+      printf '  %s\n' "$out" | head -n 3
+      printf '%s%s%s\n' "$C_DIM" "$sep" "$C_RESET"
+      continue
+    fi
+
+    local meta cores cpu_free load1 mem_used mem_avail mem_total
+    local scratch locks scratch_root host_reserved host_reason
+    meta="$(printf '%s\n' "$out" | awk -F'\t' '
+      $1=="META" {for (i=2;i<=NF;i++) print $i}
+    ')"
+    cores="$(printf '%s\n' "$meta" | kv_get cores)"
+    cpu_free="$(printf '%s\n' "$meta" | kv_get cpu_free)"
+    load1="$(printf '%s\n' "$meta" | kv_get load1)"
+    mem_used="$(printf '%s\n' "$meta" | kv_get mem_used)"
+    mem_avail="$(printf '%s\n' "$meta" | kv_get mem_avail)"
+    mem_total="$(printf '%s\n' "$meta" | kv_get mem_total)"
+    scratch="$(printf '%s\n' "$meta" | kv_get scratch)"
+    locks="$(printf '%s\n' "$meta" | kv_get locks)"
+    scratch_root="$(printf '%s\n' "$meta" | kv_get scratch_root)"
+    host_reserved="$(printf '%s\n' "$meta" | kv_get host_reserved)"
+    host_reason="$(printf '%s\n' "$meta" | kv_get host_reason)"
+
+    local cpu_used cpu_display gpu_count free_gpu_count
+    local node_status mem_display scratch_display detail
+
+    if [[ "$cores" =~ ^[0-9]+$ && "$cpu_free" =~ ^[0-9]+$ ]]; then
+      cpu_used=$((cores - cpu_free))
+      (( cpu_used < 0 )) && cpu_used=0
+      cpu_display="${cpu_used}/${cores}"
+    else
+      cpu_display="-"
+    fi
+
+    gpu_count="$(printf '%s\n' "$out" | awk -F'\t' '
+      $1=="GPU" {n++} END {print n+0}
+    ')"
+    free_gpu_count="$(printf '%s\n' "$out" | awk -F'\t' '
+      $1=="GPU" {
+        for (i=2; i<=NF; i++) {
+          if ($i == "state=free") n++
+        }
+      }
+      END {print n+0}
+    ')"
+
+    if [[ "$host_reserved" == "yes" ]]; then
+      node_status="RESERVED"
+    elif [[ "$gpu_count" -eq 0 ]]; then
+      node_status="NOGPU"
+    elif [[ "$free_gpu_count" -gt 0 ]]; then
+      node_status="READY"
+    else
+      node_status="BUSY"
+    fi
+
+    mem_display="${mem_used}/${mem_total}G"
+    scratch_display="${scratch}G"
+
+    printf '%s%-13.13s%s %s%-8.8s %-7.7s %-6.6s ' \
+      "$c_node" "$name" "$C_RESET" "$C_DIM" \
+      "$node_status" "$cpu_display" "$load1"
+    printf '%-13.13s %-9.9s %-18.18s%s\n' \
+      "$mem_display" "$scratch_display" "$tags" "$C_RESET"
+
+    if [[ "$host_reserved" == "yes" ]]; then
+      printf -v detail '  reserve=host reason=%s scratch=%s locks=%s' \
+        "${host_reason:--}" "$scratch_root" "$locks"
+    else
+      printf -v detail '  scratch=%s  locks=%s' "$scratch_root" "$locks"
+    fi
+    printf '%s%.80s%s\n' "$C_DIM" "$detail" "$C_RESET"
+
+    if [[ "$gpu_count" -gt 0 ]]; then
+      while IFS=$'\t' read -r rec f1 f2 f3 f4 f5 f6; do
+        [[ "$rec" == "GPU" ]] || continue
+
+        local idx="" state="" util="" mem_used_gpu=""
+        local mem_total_gpu="" gpu_name=""
+        local field key value state_l mem_used_gib mem_total_gib
+        local short_name state_color
+
+        for field in "$f1" "$f2" "$f3" "$f4" "$f5" "$f6"; do
+          [[ -z "$field" ]] && continue
+
+          key="${field%%=*}"
+          value="${field#*=}"
+
+          case "$key" in
+            idx) idx="$value" ;;
+            state) state="$value" ;;
+            util) util="$value" ;;
+            mem_used) mem_used_gpu="$value" ;;
+            mem_total) mem_total_gpu="$value" ;;
+            name) gpu_name="$value" ;;
+          esac
+        done
+
+        state_l="${state,,}"
+        mem_used_gib="$(mib_to_gib "$mem_used_gpu")"
+        mem_total_gib="$(mib_to_gib "$mem_total_gpu")"
+        short_name="$(short_gpu_name "$gpu_name")"
+
+        case "$state_l" in
+          free) state_color="$C_GREEN" ;;
+          busy) state_color="$C_BUSY" ;;
+          reserved) state_color="$C_RESERVED" ;;
+          locked) state_color="$C_RED" ;;
+          *) state_color="" ;;
+        esac
+
+        printf '  GPU%-2s %s%-8s%s util=%-5s ' \
+          "$idx" "$state_color" "$state_l" "$C_RESET" "${util}%"
+        printf 'mem=%s/%sG  %.22s\n' \
+          "$mem_used_gib" "$mem_total_gib" "$short_name"
+      done < <(printf '%s\n' "$out")
+    else
+      printf '  GPU       none\n'
+    fi
+
+    printf '%s%s%s\n' "$C_DIM" "$sep" "$C_RESET"
+  done < <(read_nodes)
+}
+
+validate_nodes() {
+  local file="${1:-$NODES_FILE}"
+
+  if [[ ! -f "$file" ]]; then
+    err "No such nodes file: $file"
+    exit 1
+  fi
+
+  awk '
+    /^[[:space:]]*($|#)/ {next}
+
+    NF < 4 {
+      printf "BAD line %d: expected at least 4 whitespace-separated fields\n", NR
+      bad=1
+      next
+    }
+
+    {
+      printf "OK  line %d: %s -> %s@%s env=%s tags=%s\n", NR, $1, $2, $3, $4, (NF>=5?$5:"-")
+    }
+
+    END {exit bad}
+  ' "$file"
+}
+
+choose_auto_node() {
+  local exclude_list="${1:-}"
+  local gpu_count_needed="${2:-1}"
+  ensure_nodes_file
+
+  [[ "$gpu_count_needed" =~ ^[0-9]+$ && "$gpu_count_needed" -ge 1 ]] || {
+    err "Internal error: invalid GPU count requested: $gpu_count_needed"
+    return 1
+  }
+
+  local best="" best_score=-999999
+
+  while IFS=$'\t' read -r name user host env_file tags; do
+    [[ -z "${name:-}" ]] && continue
+
+    if is_excluded_node "$name" "$exclude_list"; then
+      continue
+    fi
+
+    env_file="${env_file:-$DEFAULT_ENV_FILE}"
+
+    local target out rc
+    target="$(ssh_target "$user" "$host")"
+
+    set +e
+    out="$(remote_probe_raw "$target" "$env_file" 2>/dev/null)"
+    rc=$?
+    set -e
+
+    [[ $rc -ne 0 ]] && continue
+
+    local free_gpus scratch cpu_free meta score
+    free_gpus="$(printf '%s\n' "$out" | awk -F'\t' '$1=="GPU" && $0 ~ /state=free/ {n++} END{print n+0}')"
+    [[ "$free_gpus" -lt "$gpu_count_needed" ]] && continue
+
+    meta="$(printf '%s\n' "$out" | awk -F'\t' '$1=="META" {for (i=2;i<=NF;i++) print $i}')"
+    scratch="$(printf '%s\n' "$meta" | kv_get scratch)"
+    cpu_free="$(printf '%s\n' "$meta" | kv_get cpu_free)"
+
+    score=$(( free_gpus * 100000 + cpu_free * 100 + scratch ))
+
+    if [[ "$score" -gt "$best_score" ]]; then
+      best_score="$score"
+      best="$name"
+    fi
+  done < <(read_nodes)
+
+  [[ -n "$best" ]] && printf '%s' "$best"
+}
+
+expand_array_range() {
+  local spec="$1"
+  local IFS=',' part start end step i
+
+  for part in $spec; do
+    if [[ "$part" =~ ^([0-9]+)-([0-9]+):([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      step="${BASH_REMATCH[3]}"
+    elif [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start="${BASH_REMATCH[1]}"
+      end="${BASH_REMATCH[2]}"
+      step=1
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$part"
+      continue
+    else
+      err "Bad array range component: $part"
+      exit 1
+    fi
+
+    if (( start <= end )); then
+      for ((i=start; i<=end; i+=step)); do
+        printf '%s\n' "$i"
+      done
+    else
+      for ((i=start; i>=end; i-=step)); do
+        printf '%s\n' "$i"
+      done
+    fi
+  done
+}
+
+normalize_gpu_list() {
+  local raw="$1"
+  local item out="" seen=","
+
+  [[ -n "$raw" ]] || return 1
+
+  IFS=',' read -ra _slerb_gpu_list_parts <<< "$raw"
+
+  for item in "${_slerb_gpu_list_parts[@]}"; do
+    item="$(trim "$item")"
+
+    [[ "$item" =~ ^[0-9]+$ ]] || return 1
+
+    case "$seen" in
+      *,"$item",*) return 1 ;;
+    esac
+
+    seen="${seen}${item},"
+
+    if [[ -z "$out" ]]; then
+      out="$item"
+    else
+      out="${out},${item}"
+    fi
+  done
+
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+csv_count() {
+  local csv="$1"
+
+  [[ -n "$csv" ]] || {
+    printf '0'
+    return 0
+  }
+
+  awk -F',' '{print NF}' <<< "$csv"
+}
+
+validate_ngpu() {
+  local n="$1"
+
+  [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]]
+}
+
+history_append() {
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$JOBS_FILE"
+}
+
+history_update() {
+  local job_id="$1" status="$2" exit_code="$3" end_time="$4"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -F'\t' -v OFS='\t' -v id="$job_id" -v st="$status" -v ec="$exit_code" -v et="$end_time" '
+    $1 == id {$2=st; $3=ec; $7=et}
+    {print}
+  ' "$JOBS_FILE" > "$tmp"
+
+  mv "$tmp" "$JOBS_FILE"
+}
+
+
+history_record_launch() {
+  local job_id="$1" status="$2" exit_code="$3" node="$4"
+  local target="$5" start_time="$6" end_time="$7" local_dir="$8"
+  local remote_dir="$9" keep="${10}" input_dir="${11}" run_script="${12}"
+  local gpu_id="${13}" array_range="${14}" array_task="${15}" array_id="${16}"
+  local tmp found_file
+
+  tmp="$(mktemp)"
+  found_file="$(mktemp)"
+
+  awk -F'\t' -v OFS='\t' \
+    -v id="$job_id" -v st="$status" -v ec="$exit_code" \
+    -v node="$node" -v target="$target" -v start="$start_time" \
+    -v end="$end_time" -v local_dir="$local_dir" \
+    -v remote_dir="$remote_dir" -v keep="$keep" \
+    -v input_dir="$input_dir" -v run_script="$run_script" \
+    -v gpu_id="$gpu_id" -v array_range="$array_range" \
+    -v array_task="$array_task" -v array_id="$array_id" \
+    -v found_file="$found_file" '
+    $1 == id {
+      $2=st
+      $3=ec
+      $4=node
+      $5=target
+      $6=start
+      $7=end
+      $8=local_dir
+      $9=remote_dir
+      $10=keep
+      $11=input_dir
+      $12=run_script
+      $13=gpu_id
+      $14=array_range
+      $15=array_task
+      $16=array_id
+      found=1
+    }
+    {print}
+    END {if (found) print "found" > found_file}
+  ' "$JOBS_FILE" > "$tmp"
+
+  if [[ -s "$found_file" ]]; then
+    mv "$tmp" "$JOBS_FILE"
+  else
+    rm -f "$tmp"
+    history_append "$job_id" "$status" "$exit_code" "$node" "$target" \
+      "$start_time" "$end_time" "$local_dir" "$remote_dir" "$keep" \
+      "$input_dir" "$run_script" "$gpu_id" "$array_range" \
+      "$array_task" "$array_id"
+  fi
+
+  rm -f "$found_file"
+}
+
+history_restart_update() {
+  local job_id="$1" status="$2" exit_code="$3" target="$4"
+  local start_time="$5" end_time="$6" remote_dir="$7" gpu_id="$8"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -F'\t' -v OFS='\t' \
+    -v id="$job_id" -v st="$status" -v ec="$exit_code" \
+    -v tgt="$target" -v start="$start_time" -v et="$end_time" \
+    -v rd="$remote_dir" -v gpu="$gpu_id" '
+    $1 == id {
+      $2=st
+      $3=ec
+      $5=tgt
+      $6=start
+      $7=et
+      $9=rd
+      $13=gpu
+    }
+    {print}
+  ' "$JOBS_FILE" > "$tmp"
+
+  mv "$tmp" "$JOBS_FILE"
+}
+
+history_field() {
+  local job_id="$1" field="$2"
+  awk -F'\t' -v id="$job_id" -v f="$field" '$1 == id {print $f; exit}' "$JOBS_FILE"
+}
+
+show_jobs() {
+  local n="${1:-30}"
+
+  printf '%-32s %-10s %-5s %-12s %-5s %-8s %-19s %s\n' "JOB_ID" "STATUS" "EXIT" "NODE" "GPU" "TASK" "START" "RESULT_DIR"
+
+  tail -n "$n" "$JOBS_FILE" | while IFS=$'\t' read -r job_id status exit_code node target start_time end_time local_dir remote_dir keep input_dir run_script gpu_id array_range array_task array_id; do
+    [[ -z "${job_id:-}" ]] && continue
+    printf '%-32s %-10s %-5s %-12s %-5s %-8s %-19s %s\n' "$job_id" "$status" "$exit_code" "$node" "$gpu_id" "$array_task" "$start_time" "$local_dir"
+  done
+}
+
+show_arrays() {
+  printf '%-28s %-8s %-8s %-8s %-8s %-8s %s\n' "ARRAY_ID" "TOTAL" "DONE" "FAILED" "RUNNING" "OTHER" "TASKS"
+
+  awk -F'\t' '$16 != "" && $16 != "-" {print $16}' "$JOBS_FILE" | sort -u | while read -r aid; do
+    [[ -z "$aid" ]] && continue
+
+    awk -F'\t' -v a="$aid" '
+      $16 == a {
+        total++;
+        tasks = tasks (tasks ? "," : "") $15;
+        if ($2 == "DONE") done++;
+        else if ($2 == "FAILED" || $2 == "FAIL") failed++;
+        else if ($2 == "RUNNING" || $2 == "DETACHED" || $2 == "STAGED") running++;
+        else other++;
+      }
+      END {
+        printf "%-28s %-8d %-8d %-8d %-8d %-8d %s\n", a, total+0, done+0, failed+0, running+0, other+0, tasks
+      }
+    ' "$JOBS_FILE"
+  done
+}
+
+remote_setup_job() {
+  local target="$1" env_file="$2" job_id="$3"
+  local gpu_wanted="${4:-}"
+  local gpu_count="${5:-1}"
+  local gpu_wanted_arg="${gpu_wanted:-"-"}"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- \
+    "$env_file" "$job_id" "$gpu_wanted_arg" "$gpu_count" <<'REMOTE'
+set -euo pipefail
+
+env_file="$1"
+job_id="$2"
+gpu_wanted="${3:-}"
+[[ "$gpu_wanted" == "-" ]] && gpu_wanted=""
+gpu_count="${4:-1}"
+
+if [[ -f "$env_file" ]]; then
+  source "$env_file"
+fi
+
+SLERB_SCRATCH="${SLERB_SCRATCH:-$HOME/slerb}"
+SLERB_JOBS_ROOT="${SLERB_JOBS_ROOT:-$SLERB_SCRATCH/jobs}"
+SLERB_LOCKS_ROOT="${SLERB_LOCKS_ROOT:-$SLERB_SCRATCH/locks}"
+SLERB_WORK_ROOT="${SLERB_WORK_ROOT:-$SLERB_SCRATCH/work}"
+
+export SLERB_SCRATCH SLERB_JOBS_ROOT SLERB_LOCKS_ROOT SLERB_WORK_ROOT
+
+mkdir -p "$SLERB_JOBS_ROOT" "$SLERB_LOCKS_ROOT" "$SLERB_WORK_ROOT"
+
+if [[ -d "$SLERB_LOCKS_ROOT/host.lock" ]]; then
+  echo "HOST_RESERVED"
+  exit 64
+fi
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "NO_NVIDIA_GPU"
+  exit 60
+fi
+
+remote_job_dir="$SLERB_JOBS_ROOT/$job_id"
+
+if [[ -e "$remote_job_dir" ]]; then
+  echo "JOB_DIR_EXISTS=$remote_job_dir"
+  exit 62
+fi
+
+[[ "$gpu_count" =~ ^[0-9]+$ && "$gpu_count" -ge 1 ]] || {
+  echo "BAD_NGPU=$gpu_count"
+  exit 64
+}
+
+append_csv() {
+  local current="$1" add="$2"
+
+  if [[ -z "$current" ]]; then
+    printf '%s' "$add"
+  else
+    printf '%s,%s' "$current" "$add"
+  fi
+}
+
+cleanup_acquired_locks() {
+  local dir
+
+  IFS=',' read -ra _slerb_lock_dirs <<< "${locked_lock_dirs:-}"
+
+  for dir in "${_slerb_lock_dirs[@]}"; do
+    [[ -n "$dir" ]] && rm -rf "$dir"
+  done
+}
+
+trim_remote() {
+  local s="$*"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+find_gpu_line() {
+  local wanted="$1"
+
+  nvidia-smi \
+    --query-gpu=index,uuid,utilization.gpu,memory.used \
+    --format=csv,noheader,nounits | \
+    awk -F',' -v wanted="$wanted" '
+      {
+        idx=$1
+        uuid=$2
+        util=$3
+        mem=$4
+
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", idx)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", uuid)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", util)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", mem)
+
+        if (idx == wanted && found == 0) {
+          printf "%s\t%s\t%s\n", uuid, util, mem
+          found=1
+        }
+      }
+    '
+}
+
+write_lock_info() {
+  local lock_dir="$1" idx="$2" uuid="$3"
+
+  {
+    printf 'type=job\n'
+    printf 'job_id=%s\n' "$job_id"
+    printf 'user=%s\n' "$USER"
+    printf 'host=%s\n' "$(hostname -s 2>/dev/null || hostname)"
+    printf 'start_time=%s\n' "$(date -Is)"
+    printf 'gpu_id=%s\n' "$idx"
+    printf 'gpu_uuid=%s\n' "$uuid"
+  } > "$lock_dir/info"
+}
+
+mkdir -p "$remote_job_dir/work"
+
+locked_gpu_ids=""
+locked_gpu_uuids=""
+locked_lock_dirs=""
+
+if [[ -n "$gpu_wanted" ]]; then
+  IFS=',' read -ra wanted_ids <<< "$gpu_wanted"
+  gpu_count="${#wanted_ids[@]}"
+
+  for wanted_id in "${wanted_ids[@]}"; do
+    wanted_id="$(trim_remote "$wanted_id")"
+
+    [[ "$wanted_id" =~ ^[0-9]+$ ]] || {
+      cleanup_acquired_locks
+      rmdir "$remote_job_dir/work" "$remote_job_dir" 2>/dev/null || true
+      echo "BAD_GPU_ID=$wanted_id"
+      exit 64
+    }
+
+    gpu_line="$(find_gpu_line "$wanted_id")"
+
+    if [[ -z "$gpu_line" ]]; then
+      cleanup_acquired_locks
+      rmdir "$remote_job_dir/work" "$remote_job_dir" 2>/dev/null || true
+      echo "NO_SUCH_GPU=$wanted_id"
+      exit 66
+    fi
+
+    IFS=$'\t' read -r gpu_uuid gpu_util gpu_mem_used <<< "$gpu_line"
+
+    [[ "$gpu_util" =~ ^[0-9]+$ ]] || gpu_util=999
+    [[ "$gpu_mem_used" =~ ^[0-9]+$ ]] || gpu_mem_used=999999
+
+    lock_dir="$SLERB_LOCKS_ROOT/gpu-$wanted_id.lock"
+
+    if [[ "$gpu_util" -gt 5 || "$gpu_mem_used" -gt 512 ]]; then
+      cleanup_acquired_locks
+      rmdir "$remote_job_dir/work" "$remote_job_dir" 2>/dev/null || true
+      echo "REQUESTED_GPU_NOT_FREE=$wanted_id util=$gpu_util mem_used=$gpu_mem_used"
+      exit 63
+    fi
+
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+      cleanup_acquired_locks
+      rmdir "$remote_job_dir/work" "$remote_job_dir" 2>/dev/null || true
+      echo "REQUESTED_GPU_NOT_FREE=$wanted_id"
+      exit 63
+    fi
+
+    write_lock_info "$lock_dir" "$wanted_id" "$gpu_uuid"
+    locked_gpu_ids="$(append_csv "$locked_gpu_ids" "$wanted_id")"
+    locked_gpu_uuids="$(append_csv "$locked_gpu_uuids" "$gpu_uuid")"
+    locked_lock_dirs="$(append_csv "$locked_lock_dirs" "$lock_dir")"
+  done
+else
+  while IFS=',' read -r idx uuid util mem_used; do
+    idx="$(trim_remote "$idx")"
+    uuid="$(trim_remote "$uuid")"
+    util="$(trim_remote "$util")"
+    mem_used="$(trim_remote "$mem_used")"
+
+    [[ -z "$idx" ]] && continue
+
+    [[ "$util" =~ ^[0-9]+$ ]] || util=999
+    [[ "$mem_used" =~ ^[0-9]+$ ]] || mem_used=999999
+
+    if [[ "$util" -le 5 && "$mem_used" -le 512 ]]; then
+      lock_dir="$SLERB_LOCKS_ROOT/gpu-$idx.lock"
+
+      if mkdir "$lock_dir" 2>/dev/null; then
+        write_lock_info "$lock_dir" "$idx" "$uuid"
+        locked_gpu_ids="$(append_csv "$locked_gpu_ids" "$idx")"
+        locked_gpu_uuids="$(append_csv "$locked_gpu_uuids" "$uuid")"
+        locked_lock_dirs="$(append_csv "$locked_lock_dirs" "$lock_dir")"
+      fi
+    fi
+
+    if [[ "$(awk -F',' '{print NF}' <<< "$locked_gpu_ids")" -ge "$gpu_count" ]]; then
+      break
+    fi
+  done < <(
+    nvidia-smi \
+      --query-gpu=index,uuid,utilization.gpu,memory.used \
+      --format=csv,noheader,nounits
+  )
+fi
+
+locked_count=0
+[[ -n "$locked_gpu_ids" ]] && locked_count="$(awk -F',' '{print NF}' <<< "$locked_gpu_ids")"
+
+if [[ "$locked_count" -lt "$gpu_count" ]]; then
+  cleanup_acquired_locks
+  rmdir "$remote_job_dir/work" "$remote_job_dir" 2>/dev/null || true
+
+  if [[ -n "$gpu_wanted" ]]; then
+    echo "REQUESTED_GPUS_NOT_FREE=$gpu_wanted"
+    exit 63
+  fi
+
+  echo "NO_FREE_GPUS need=$gpu_count found=$locked_count"
+  exit 61
+fi
+
+first_gpu_id="${locked_gpu_ids%%,*}"
+first_gpu_uuid="${locked_gpu_uuids%%,*}"
+first_lock_dir="${locked_lock_dirs%%,*}"
+
+{
+  printf 'JOB_ID=%s\n' "$job_id"
+  printf 'REMOTE_DIR=%s\n' "$remote_job_dir"
+  printf 'WORK_DIR=%s\n' "$remote_job_dir/work"
+  printf 'LOCK_DIR=%s\n' "$first_lock_dir"
+  printf 'LOCK_DIRS=%s\n' "$locked_lock_dirs"
+  printf 'GPU_ID=%s\n' "$first_gpu_id"
+  printf 'GPU_IDS=%s\n' "$locked_gpu_ids"
+  printf 'GPU_UUID=%s\n' "$first_gpu_uuid"
+  printf 'GPU_UUIDS=%s\n' "$locked_gpu_uuids"
+  printf 'GPU_COUNT=%s\n' "$locked_count"
+  printf 'SLERB_SCRATCH=%s\n' "$SLERB_SCRATCH"
+  printf 'STATUS=STAGED\n'
+} > "$remote_job_dir/.slerb_state"
+
+printf 'REMOTE_DIR=%s\n' "$remote_job_dir"
+printf 'WORK_DIR=%s\n' "$remote_job_dir/work"
+printf 'GPU_ID=%s\n' "$first_gpu_id"
+printf 'GPU_IDS=%s\n' "$locked_gpu_ids"
+printf 'GPU_UUID=%s\n' "$first_gpu_uuid"
+printf 'GPU_UUIDS=%s\n' "$locked_gpu_uuids"
+printf 'GPU_COUNT=%s\n' "$locked_count"
+printf 'LOCK_DIR=%s\n' "$first_lock_dir"
+printf 'LOCK_DIRS=%s\n' "$locked_lock_dirs"
+printf 'SLERB_SCRATCH=%s\n' "$SLERB_SCRATCH"
+REMOTE
+}
+
+remote_abort_job() {
+  local target="$1" env_file="$2" remote_dir="$3"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- "$env_file" "$remote_dir" <<'REMOTE' || true
+set -u
+
+env_file="$1"
+remote_dir="$2"
+
+if [[ -f "$env_file" ]]; then
+  source "$env_file" >/dev/null 2>&1 || true
+fi
+
+cleanup_slerb_locks() {
+  local dirs="${LOCK_DIRS:-${LOCK_DIR:-}}"
+  local dir
+
+  IFS=',' read -ra _slerb_cleanup_lock_dirs <<< "$dirs"
+
+  for dir in "${_slerb_cleanup_lock_dirs[@]}"; do
+    [[ -n "$dir" ]] && rm -rf "$dir"
+  done
+}
+
+if [[ -f "$remote_dir/.slerb_state" ]]; then
+  source "$remote_dir/.slerb_state" >/dev/null 2>&1 || true
+  cleanup_slerb_locks
+fi
+
+rm -rf "$remote_dir"
+REMOTE
+}
+
+remote_run_foreground() {
+  local target="$1" env_file="$2" remote_dir="$3" gpu_id="$4" job_id="$5" array_task="$6" array_range="$7" array_id="$8"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- "$env_file" "$remote_dir" "$gpu_id" "$job_id" "$array_task" "$array_range" "$array_id" <<'REMOTE'
+set -uo pipefail
+
+env_file="$1"
+remote_dir="$2"
+gpu_id_arg="$3"
+job_id="$4"
+array_task="$5"
+array_range="$6"
+array_id="$7"
+
+source "$remote_dir/.slerb_state"
+echo $$ > "$remote_dir/pid"
+
+logical_cuda_devices() {
+  local count="${1:-1}"
+  local out="" i
+
+  [[ "$count" =~ ^[0-9]+$ && "$count" -ge 1 ]] || count=1
+
+  for ((i=0; i<count; i++)); do
+    if [[ -z "$out" ]]; then
+      out="$i"
+    else
+      out="${out},${i}"
+    fi
+  done
+
+  printf '%s' "$out"
+}
+
+cleanup_slerb_locks() {
+  local dirs="${LOCK_DIRS:-${LOCK_DIR:-}}"
+  local dir
+
+  IFS=',' read -ra _slerb_cleanup_lock_dirs <<< "$dirs"
+
+  for dir in "${_slerb_cleanup_lock_dirs[@]}"; do
+    [[ -n "$dir" ]] && rm -rf "$dir"
+  done
+}
+
+set_slerb_runtime_env() {
+  local gpu_ids="${GPU_IDS:-${GPU_ID:-$gpu_id_arg}}"
+  local gpu_uuids="${GPU_UUIDS:-${GPU_UUID:-}}"
+  local gpu_count="${GPU_COUNT:-1}"
+  local first_gpu_id="${GPU_ID:-${gpu_ids%%,*}}"
+  local first_gpu_uuid="${GPU_UUID:-${gpu_uuids%%,*}}"
+
+  [[ "$gpu_count" =~ ^[0-9]+$ && "$gpu_count" -ge 1 ]] || gpu_count=1
+
+  export JOB_ID="$job_id"
+  export NSLOTS=1
+
+  export SLERB_GPU_ID="$first_gpu_id"
+  export SLERB_GPU_IDS="$gpu_ids"
+  export SLERB_GPU_PHYSICAL_ID="$first_gpu_id"
+  export SLERB_GPU_UUID="$first_gpu_uuid"
+  export SLERB_GPU_UUIDS="$gpu_uuids"
+  export SLERB_GPU_COUNT="$gpu_count"
+  export SLERB_CUDA_DEVICE=0
+  export SLERB_CUDA_DEVICES="$(logical_cuda_devices "$gpu_count")"
+
+  if [[ -n "$gpu_uuids" ]]; then
+    export CUDA_VISIBLE_DEVICES="$gpu_uuids"
+  else
+    export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+    export CUDA_VISIBLE_DEVICES="$gpu_ids"
+  fi
+
+  export SLERB_JOB_ID="$job_id"
+  export SLERB_REMOTE_DIR="$remote_dir"
+  export SLERB_WORK_DIR="$WORK_DIR"
+
+  if [[ "$array_task" != "-" ]]; then
+    export SGE_TASK_ID="$array_task"
+    export TASK_ID="$array_task"
+    export SLERB_ARRAY_TASK_ID="$array_task"
+    export SLERB_ARRAY_RANGE="$array_range"
+    export SLERB_ARRAY_ID="$array_id"
+  fi
+}
+
+set_slerb_runtime_env
+
+if [[ -f "$env_file" ]]; then
+  source "$env_file"
+fi
+
+set_slerb_runtime_env
+
+cd "$WORK_DIR" || exit 70
+
+{
+  echo "SLERB job started: $(date -Is)"
+  echo "job_id=$JOB_ID"
+  echo "pwd=$PWD"
+  echo "gpu_physical=${SLERB_GPU_IDS:-}"
+  echo "gpu_uuid=${SLERB_GPU_UUIDS:-}"
+  echo "gpu_count=${SLERB_GPU_COUNT:-}"
+  echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
+  echo "cuda_devices=${SLERB_CUDA_DEVICES:-}"
+  echo "array_task=${SGE_TASK_ID:-}"
+  bash ./run.sh
+} > "$remote_dir/job.log" 2>&1
+
+rc=$?
+
+if grep -q '^STATUS=CANCELED$' "$remote_dir/.slerb_state" 2>/dev/null; then
+  exit "$rc"
+fi
+
+echo "$rc" > "$remote_dir/exit_code"
+
+{
+  grep -v '^STATUS=' "$remote_dir/.slerb_state" 2>/dev/null || true
+
+  if [[ "$rc" -eq 0 ]]; then
+    echo "STATUS=DONE"
+  else
+    echo "STATUS=FAILED"
+  fi
+
+  echo "END_TIME=$(date -Is)"
+} > "$remote_dir/.slerb_state.tmp"
+
+mv "$remote_dir/.slerb_state.tmp" "$remote_dir/.slerb_state"
+cleanup_slerb_locks
+
+exit "$rc"
+REMOTE
+}
+
+remote_run_detached() {
+  local target="$1" env_file="$2" remote_dir="$3" gpu_id="$4" job_id="$5" array_task="$6" array_range="$7" array_id="$8"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- "$env_file" "$remote_dir" "$gpu_id" "$job_id" "$array_task" "$array_range" "$array_id" <<'REMOTE'
+set -euo pipefail
+
+env_file="$1"
+remote_dir="$2"
+gpu_id="$3"
+job_id="$4"
+array_task="$5"
+array_range="$6"
+array_id="$7"
+
+cat > "$remote_dir/.slerb_launcher.sh" <<'LAUNCHER'
+#!/usr/bin/env bash
+set -uo pipefail
+
+env_file="$1"
+remote_dir="$2"
+gpu_id_arg="$3"
+job_id="$4"
+array_task="$5"
+array_range="$6"
+array_id="$7"
+
+source "$remote_dir/.slerb_state"
+echo $$ > "$remote_dir/pid"
+
+logical_cuda_devices() {
+  local count="${1:-1}"
+  local out="" i
+
+  [[ "$count" =~ ^[0-9]+$ && "$count" -ge 1 ]] || count=1
+
+  for ((i=0; i<count; i++)); do
+    if [[ -z "$out" ]]; then
+      out="$i"
+    else
+      out="${out},${i}"
+    fi
+  done
+
+  printf '%s' "$out"
+}
+
+cleanup_slerb_locks() {
+  local dirs="${LOCK_DIRS:-${LOCK_DIR:-}}"
+  local dir
+
+  IFS=',' read -ra _slerb_cleanup_lock_dirs <<< "$dirs"
+
+  for dir in "${_slerb_cleanup_lock_dirs[@]}"; do
+    [[ -n "$dir" ]] && rm -rf "$dir"
+  done
+}
+
+set_slerb_runtime_env() {
+  local gpu_ids="${GPU_IDS:-${GPU_ID:-$gpu_id_arg}}"
+  local gpu_uuids="${GPU_UUIDS:-${GPU_UUID:-}}"
+  local gpu_count="${GPU_COUNT:-1}"
+  local first_gpu_id="${GPU_ID:-${gpu_ids%%,*}}"
+  local first_gpu_uuid="${GPU_UUID:-${gpu_uuids%%,*}}"
+
+  [[ "$gpu_count" =~ ^[0-9]+$ && "$gpu_count" -ge 1 ]] || gpu_count=1
+
+  export JOB_ID="$job_id"
+  export NSLOTS=1
+
+  export SLERB_GPU_ID="$first_gpu_id"
+  export SLERB_GPU_IDS="$gpu_ids"
+  export SLERB_GPU_PHYSICAL_ID="$first_gpu_id"
+  export SLERB_GPU_UUID="$first_gpu_uuid"
+  export SLERB_GPU_UUIDS="$gpu_uuids"
+  export SLERB_GPU_COUNT="$gpu_count"
+  export SLERB_CUDA_DEVICE=0
+  export SLERB_CUDA_DEVICES="$(logical_cuda_devices "$gpu_count")"
+
+  if [[ -n "$gpu_uuids" ]]; then
+    export CUDA_VISIBLE_DEVICES="$gpu_uuids"
+  else
+    export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+    export CUDA_VISIBLE_DEVICES="$gpu_ids"
+  fi
+
+  export SLERB_JOB_ID="$job_id"
+  export SLERB_REMOTE_DIR="$remote_dir"
+  export SLERB_WORK_DIR="$WORK_DIR"
+
+  if [[ "$array_task" != "-" ]]; then
+    export SGE_TASK_ID="$array_task"
+    export TASK_ID="$array_task"
+    export SLERB_ARRAY_TASK_ID="$array_task"
+    export SLERB_ARRAY_RANGE="$array_range"
+    export SLERB_ARRAY_ID="$array_id"
+  fi
+}
+
+set_slerb_runtime_env
+
+if [[ -f "$env_file" ]]; then
+  source "$env_file"
+fi
+
+set_slerb_runtime_env
+
+cd "$WORK_DIR" || exit 70
+
+{
+  echo "SLERB job started: $(date -Is)"
+  echo "job_id=$JOB_ID"
+  echo "pwd=$PWD"
+  echo "gpu_physical=${SLERB_GPU_IDS:-}"
+  echo "gpu_uuid=${SLERB_GPU_UUIDS:-}"
+  echo "gpu_count=${SLERB_GPU_COUNT:-}"
+  echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
+  echo "cuda_devices=${SLERB_CUDA_DEVICES:-}"
+  echo "array_task=${SGE_TASK_ID:-}"
+  bash ./run.sh
+} > "$remote_dir/job.log" 2>&1
+
+rc=$?
+
+if grep -q '^STATUS=CANCELED$' "$remote_dir/.slerb_state" 2>/dev/null; then
+  exit "$rc"
+fi
+
+echo "$rc" > "$remote_dir/exit_code"
+
+{
+  grep -v '^STATUS=' "$remote_dir/.slerb_state" 2>/dev/null | \
+    grep -v '^END_TIME=' || true
+
+  if [[ "$rc" -eq 0 ]]; then
+    echo "STATUS=DONE"
+  else
+    echo "STATUS=FAILED"
+  fi
+
+  echo "END_TIME=$(date -Is)"
+} > "$remote_dir/.slerb_state.tmp"
+
+mv "$remote_dir/.slerb_state.tmp" "$remote_dir/.slerb_state"
+cleanup_slerb_locks
+
+exit "$rc"
+LAUNCHER
+
+chmod +x "$remote_dir/.slerb_launcher.sh"
+
+if command -v setsid >/dev/null 2>&1; then
+  nohup setsid "$remote_dir/.slerb_launcher.sh" \
+    "$env_file" "$remote_dir" "$gpu_id" "$job_id" \
+    "$array_task" "$array_range" "$array_id" >/dev/null 2>&1 &
+else
+  nohup "$remote_dir/.slerb_launcher.sh" \
+    "$env_file" "$remote_dir" "$gpu_id" "$job_id" \
+    "$array_task" "$array_range" "$array_id" >/dev/null 2>&1 &
+fi
+
+launcher_pid="$!"
+
+for _ in 1 2 3 4 5; do
+  [[ -s "$remote_dir/pid" ]] && break
+  sleep 0.1
+done
+
+[[ -s "$remote_dir/pid" ]] || echo "$launcher_pid" > "$remote_dir/pid"
+REMOTE
+}
+
+remote_prepare_restart() {
+  local target="$1" env_file="$2" remote_dir="$3"
+  local job_id="$4" gpu_wanted="${5:-}" force="${6:-no}"
+  local gpu_wanted_arg="${gpu_wanted:-"-"}"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- \
+    "$env_file" "$remote_dir" "$job_id" "$gpu_wanted_arg" "$force" <<'REMOTE'
+set -euo pipefail
+
+env_file="$1"
+remote_dir="$2"
+job_id="$3"
+gpu_wanted="${4:-}"
+[[ "$gpu_wanted" == "-" ]] && gpu_wanted=""
+force="${5:-no}"
+
+case "$force" in
+  yes|no) ;;
+  *)
+    echo "BAD_FORCE=$force"
+    exit 64
+    ;;
+esac
+
+if [[ -f "$env_file" ]]; then
+  source "$env_file"
+fi
+
+SLERB_SCRATCH="${SLERB_SCRATCH:-$HOME/slerb}"
+SLERB_JOBS_ROOT="${SLERB_JOBS_ROOT:-$SLERB_SCRATCH/jobs}"
+SLERB_LOCKS_ROOT="${SLERB_LOCKS_ROOT:-$SLERB_SCRATCH/locks}"
+SLERB_WORK_ROOT="${SLERB_WORK_ROOT:-$SLERB_SCRATCH/work}"
+
+export SLERB_SCRATCH SLERB_JOBS_ROOT SLERB_LOCKS_ROOT SLERB_WORK_ROOT
+
+mkdir -p "$SLERB_JOBS_ROOT" "$SLERB_LOCKS_ROOT" "$SLERB_WORK_ROOT"
+
+state_file="$remote_dir/.slerb_state"
+
+if [[ -f "$state_file" ]]; then
+  source "$state_file"
+fi
+
+work_dir="${WORK_DIR:-$remote_dir/work}"
+gpu_ids="$gpu_wanted"
+
+if [[ -z "$gpu_ids" || "$gpu_ids" == "-" ]]; then
+  gpu_ids="${GPU_IDS:-${GPU_ID:-}}"
+fi
+
+if [[ -z "$gpu_ids" || "$gpu_ids" == "-" ]]; then
+  echo "MISSING_GPU_ID"
+  exit 64
+fi
+
+trim_remote() {
+  local s="$*"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+append_csv() {
+  local current="$1" add="$2"
+
+  if [[ -z "$current" ]]; then
+    printf '%s' "$add"
+  else
+    printf '%s,%s' "$current" "$add"
+  fi
+}
+
+normalize_gpu_ids_remote() {
+  local raw="$1" item out="" seen=","
+
+  IFS=',' read -ra _slerb_restart_gpu_ids <<< "$raw"
+
+  for item in "${_slerb_restart_gpu_ids[@]}"; do
+    item="$(trim_remote "$item")"
+
+    [[ "$item" =~ ^[0-9]+$ ]] || return 1
+
+    case "$seen" in
+      *,"$item",*) return 1 ;;
+    esac
+
+    seen="${seen}${item},"
+    out="$(append_csv "$out" "$item")"
+  done
+
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+gpu_ids="$(normalize_gpu_ids_remote "$gpu_ids")" || {
+  echo "BAD_GPU_ID=$gpu_ids"
+  exit 64
+}
+
+gpu_count="$(awk -F',' '{print NF}' <<< "$gpu_ids")"
+
+lock_dirs_for_gpu_ids() {
+  local ids="$1" id out=""
+
+  IFS=',' read -ra _slerb_lock_gpu_ids <<< "$ids"
+
+  for id in "${_slerb_lock_gpu_ids[@]}"; do
+    out="$(append_csv "$out" "$SLERB_LOCKS_ROOT/gpu-$id.lock")"
+  done
+
+  printf '%s' "$out"
+}
+
+target_lock_dirs="$(lock_dirs_for_gpu_ids "$gpu_ids")"
+
+remove_restart_lock_if_ours() {
+  local candidate="$1"
+  local lock_type="" lock_job_id=""
+
+  [[ -n "$candidate" ]] || return 0
+  [[ -d "$candidate" ]] || return 0
+
+  case "$candidate" in
+    "$SLERB_LOCKS_ROOT"/gpu-*.lock) ;;
+    *) return 0 ;;
+  esac
+
+  if [[ -f "$candidate/info" ]]; then
+    lock_type="$(awk -F= '$1=="type" {print $2; exit}' "$candidate/info")"
+    lock_job_id="$(awk -F= '$1=="job_id" {print $2; exit}' "$candidate/info")"
+  fi
+
+  if [[ "$lock_type" == "reservation" ]]; then
+    echo "GPU_RESERVED=${candidate##*/}"
+    exit 65
+  fi
+
+  if [[ "$lock_job_id" == "$job_id" ]]; then
+    rm -rf "$candidate"
+    return 0
+  fi
+
+  if [[ -z "$lock_job_id" && "$force" == "yes" ]]; then
+    rm -rf "$candidate"
+    return 0
+  fi
+
+  if [[ -z "$lock_job_id" ]]; then
+    echo "GPU_LOCK_EXISTS_WITHOUT_JOB_ID=${candidate##*/}"
+    exit 65
+  fi
+
+  echo "GPU_LOCKED_BY_OTHER_JOB=$lock_job_id"
+  exit 65
+}
+
+remove_lock_csv_if_ours() {
+  local dirs="$1" dir
+
+  IFS=',' read -ra _slerb_restart_lock_dirs <<< "$dirs"
+
+  for dir in "${_slerb_restart_lock_dirs[@]}"; do
+    remove_restart_lock_if_ours "$dir"
+  done
+}
+
+if [[ ! -d "$remote_dir" ]]; then
+  remove_lock_csv_if_ours "$target_lock_dirs"
+  echo "MISSING_REMOTE_DIR=$remote_dir"
+  exit 76
+fi
+
+if [[ ! -f "$work_dir/run.sh" ]]; then
+  remove_lock_csv_if_ours "${LOCK_DIRS:-${LOCK_DIR:-}}"
+  remove_lock_csv_if_ours "$target_lock_dirs"
+  echo "MISSING_RUN_SCRIPT=$work_dir/run.sh"
+  exit 78
+fi
+
+job_pids() {
+  local self self_pgid pid cwd
+
+  self="$$"
+  self_pgid="$(ps -o pgid= -p "$self" 2>/dev/null | tr -d ' ')"
+
+  ps -eo pid=,ppid=,pgid=,sid=,cmd= | awk \
+    -v rd="$remote_dir" \
+    -v wd="$work_dir" \
+    -v self="$self" \
+    -v self_pgid="$self_pgid" '
+      {
+        pid=$1
+        ppid=$2
+        pgid=$3
+        cmd=$0
+      }
+
+      pid == self {next}
+      ppid == self {next}
+      pgid == self_pgid {next}
+
+      cmd ~ /bash -s --/ {next}
+      cmd ~ /awk -v rd=/ {next}
+      cmd ~ /ps -eo/ {next}
+
+      index(cmd, rd) || index(cmd, wd) {
+        print pid
+      }
+    ' 2>/dev/null || true
+
+  if [[ -d /proc ]]; then
+    for proc_dir in /proc/[0-9]*; do
+      [[ -d "$proc_dir" ]] || continue
+      pid="${proc_dir##*/}"
+      [[ "$pid" == "$self" ]] && continue
+
+      cwd="$(readlink "$proc_dir/cwd" 2>/dev/null || true)"
+
+      case "$cwd" in
+        "$work_dir"|"$work_dir"/*)
+          printf '%s\n' "$pid"
+          ;;
+      esac
+    done
+  fi
+}
+
+running_pids="$(job_pids | sort -n -u | tr '\n' ' ' | xargs || true)"
+
+if [[ -n "$running_pids" && "$force" != "yes" ]]; then
+  echo "JOB_STILL_RUNNING=$running_pids"
+  exit 75
+fi
+
+if [[ -n "$running_pids" && "$force" == "yes" ]]; then
+  # shellcheck disable=SC2086
+  kill -TERM $running_pids 2>/dev/null || true
+
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    running_pids="$(job_pids | sort -n -u | tr '\n' ' ' | xargs || true)"
+    [[ -z "$running_pids" ]] && break
+  done
+
+  if [[ -n "$running_pids" ]]; then
+    # shellcheck disable=SC2086
+    kill -KILL $running_pids 2>/dev/null || true
+    sleep 1
+  fi
+
+  running_pids="$(job_pids | sort -n -u | tr '\n' ' ' | xargs || true)"
+
+  if [[ -n "$running_pids" ]]; then
+    echo "FAILED_TO_KILL=$running_pids"
+    exit 70
+  fi
+fi
+
+remove_lock_csv_if_ours "${LOCK_DIRS:-${LOCK_DIR:-}}"
+remove_lock_csv_if_ours "$target_lock_dirs"
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "NO_NVIDIA_GPU"
+  exit 60
+fi
+
+cleanup_acquired_locks() {
+  local dir
+
+  IFS=',' read -ra _slerb_acquired_lock_dirs <<< "${new_lock_dirs:-}"
+
+  for dir in "${_slerb_acquired_lock_dirs[@]}"; do
+    [[ -n "$dir" ]] && rm -rf "$dir"
+  done
+}
+
+find_gpu_line() {
+  local wanted="$1"
+
+  nvidia-smi \
+    --query-gpu=index,uuid,utilization.gpu,memory.used \
+    --format=csv,noheader,nounits | \
+    awk -F',' -v wanted="$wanted" '
+      {
+        idx=$1
+        uuid=$2
+        util=$3
+        mem=$4
+
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", idx)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", uuid)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", util)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", mem)
+
+        if (idx == wanted && found == 0) {
+          printf "%s\t%s\t%s\n", uuid, util, mem
+          found=1
+        }
+      }
+    '
+}
+
+write_lock_info() {
+  local lock_dir="$1" idx="$2" uuid="$3"
+
+  {
+    printf 'type=job\n'
+    printf 'job_id=%s\n' "$job_id"
+    printf 'user=%s\n' "$USER"
+    printf 'host=%s\n' "$(hostname -s 2>/dev/null || hostname)"
+    printf 'start_time=%s\n' "$(date -Is)"
+    printf 'gpu_id=%s\n' "$idx"
+    printf 'gpu_uuid=%s\n' "$uuid"
+  } > "$lock_dir/info"
+}
+
+new_gpu_uuids=""
+new_lock_dirs=""
+
+IFS=',' read -ra restart_gpu_ids <<< "$gpu_ids"
+
+for gpu_id in "${restart_gpu_ids[@]}"; do
+  gpu_line="$(find_gpu_line "$gpu_id")"
+
+  if [[ -z "$gpu_line" ]]; then
+    cleanup_acquired_locks
+    echo "NO_SUCH_GPU=$gpu_id"
+    exit 66
+  fi
+
+  IFS=$'\t' read -r gpu_uuid gpu_util gpu_mem_used <<< "$gpu_line"
+
+  [[ "$gpu_util" =~ ^[0-9]+$ ]] || gpu_util=999
+  [[ "$gpu_mem_used" =~ ^[0-9]+$ ]] || gpu_mem_used=999999
+
+  if [[ "$gpu_util" -gt 5 || "$gpu_mem_used" -gt 512 ]]; then
+    cleanup_acquired_locks
+    echo "GPU_BUSY=$gpu_id util=$gpu_util mem_used=$gpu_mem_used"
+    exit 63
+  fi
+
+  lock_dir="$SLERB_LOCKS_ROOT/gpu-$gpu_id.lock"
+
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    cleanup_acquired_locks
+    echo "GPU_LOCK_RACE=$gpu_id"
+    exit 63
+  fi
+
+  write_lock_info "$lock_dir" "$gpu_id" "$gpu_uuid"
+  new_gpu_uuids="$(append_csv "$new_gpu_uuids" "$gpu_uuid")"
+  new_lock_dirs="$(append_csv "$new_lock_dirs" "$lock_dir")"
+done
+
+first_gpu_id="${gpu_ids%%,*}"
+first_gpu_uuid="${new_gpu_uuids%%,*}"
+first_lock_dir="${new_lock_dirs%%,*}"
+
+stamp="$(date +%Y%m%d-%H%M%S)"
+
+if [[ -f "$remote_dir/job.log" ]]; then
+  mv "$remote_dir/job.log" "$remote_dir/job.log.restart-$stamp"
+fi
+
+if [[ -f "$remote_dir/exit_code" ]]; then
+  mv "$remote_dir/exit_code" "$remote_dir/exit_code.restart-$stamp"
+fi
+
+rm -f "$remote_dir/pid"
+
+{
+  printf 'JOB_ID=%s\n' "$job_id"
+  printf 'REMOTE_DIR=%s\n' "$remote_dir"
+  printf 'WORK_DIR=%s\n' "$work_dir"
+  printf 'LOCK_DIR=%s\n' "$first_lock_dir"
+  printf 'LOCK_DIRS=%s\n' "$new_lock_dirs"
+  printf 'GPU_ID=%s\n' "$first_gpu_id"
+  printf 'GPU_IDS=%s\n' "$gpu_ids"
+  printf 'GPU_UUID=%s\n' "$first_gpu_uuid"
+  printf 'GPU_UUIDS=%s\n' "$new_gpu_uuids"
+  printf 'GPU_COUNT=%s\n' "$gpu_count"
+  printf 'SLERB_SCRATCH=%s\n' "$SLERB_SCRATCH"
+  printf 'STATUS=STAGED\n'
+} > "$state_file"
+
+printf 'REMOTE_DIR=%s\n' "$remote_dir"
+printf 'WORK_DIR=%s\n' "$work_dir"
+printf 'GPU_ID=%s\n' "$first_gpu_id"
+printf 'GPU_IDS=%s\n' "$gpu_ids"
+printf 'GPU_UUID=%s\n' "$first_gpu_uuid"
+printf 'GPU_UUIDS=%s\n' "$new_gpu_uuids"
+printf 'GPU_COUNT=%s\n' "$gpu_count"
+printf 'LOCK_DIR=%s\n' "$first_lock_dir"
+printf 'LOCK_DIRS=%s\n' "$new_lock_dirs"
+REMOTE
+}
+
+rsync_to_remote() {
+  local src="$1" target="$2" dst="$3"
+
+  rsync -azcL \
+    --exclude '.git/' \
+    --exclude '.slerb/' \
+    --exclude 'slerb-results/' \
+    "$src" "$target:$dst"
+}
+
+rsync_from_remote() {
+  local target="$1" src="$2" dst="$3"
+
+  mkdir -p "$dst"
+  rsync -azcL "$target:$src/" "$dst/"
+}
+
+rsync_to_queue_spool() {
+  local src="$1" dst="$2"
+
+  mkdir -p "$dst"
+  rsync -azcL \
+    --exclude '.git/' \
+    --exclude '.slerb/' \
+    --exclude 'slerb-results/' \
+    "$src" "$dst"
+}
+
+write_request_var() {
+  local key="$1" value="${2:-}"
+  printf '%s=%q\n' "$key" "$value"
+}
+
+queue_remove_job() {
+  local job_id="$1"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -F'\t' -v OFS='\t' -v id="$job_id" '$1 != id {print}' \
+    "$QUEUE_FILE" > "$tmp"
+  mv "$tmp" "$QUEUE_FILE"
+}
+
+queue_spool_dir() {
+  local job_id="$1"
+  awk -F'\t' -v id="$job_id" '$1 == id {print $3; exit}' "$QUEUE_FILE"
+}
+
+queue_has_jobs() {
+  [[ -s "$QUEUE_FILE" ]]
+}
+
+show_queue() {
+  printf '%-32s %-19s %-12s %-6s %-8s %s\n' \
+    "JOB_ID" "QUEUED" "NODE" "NGPU" "GPU" "OUTPUT_DIR"
+
+  while IFS=$'\t' read -r job_id queued_at spool_dir; do
+    [[ -n "${job_id:-}" ]] || continue
+    [[ -f "$spool_dir/request.env" ]] || continue
+
+    unset NODE_ARG OUTPUT_DIR GPU_WANTED GPU_COUNT
+    # shellcheck disable=SC1090
+    source "$spool_dir/request.env" >/dev/null 2>&1 || true
+
+    printf '%-32s %-19s %-12s %-6s %-8s %s\n' \
+      "$job_id" "$queued_at" "${NODE_ARG:--}" "${GPU_COUNT:--}" \
+      "${GPU_WANTED:--}" "${OUTPUT_DIR:--}"
+  done < "$QUEUE_FILE"
+}
+
+is_resource_rc() {
+  case "$1" in
+    61|63|64|81)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+queue_job() {
+  local job_id="$1" node_arg="$2" input_dir="$3" run_script="$4"
+  local output_dir="$5" keep="$6" detach="$7" array_task="$8"
+  local array_range="$9" array_id="${10}" exclude_list="${11:-}"
+  local gpu_wanted="${12:-}" gpu_count="${13:-1}"
+  local spool_dir spool_input queued_at local_job_dir gpu_req
+
+  spool_dir="$QUEUE_DIR/$job_id"
+  spool_input="$spool_dir/input"
+  queued_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  local_job_dir="$output_dir/$job_id"
+
+  rm -rf "$spool_dir"
+  mkdir -p "$spool_input" "$local_job_dir"
+
+  set +e
+  rsync_to_queue_spool "$input_dir/" "$spool_input/"
+  local rc=$?
+  if [[ $rc -eq 0 ]]; then
+    cp -L "$run_script" "$spool_dir/run.sh"
+    rc=$?
+  fi
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    rm -rf "$spool_dir"
+    err "Could not queue $job_id: failed to snapshot input or run script"
+    return "$rc"
+  fi
+
+  chmod +x "$spool_dir/run.sh" 2>/dev/null || true
+
+  {
+    write_request_var JOB_ID "$job_id"
+    write_request_var NODE_ARG "$node_arg"
+    write_request_var INPUT_DIR "$spool_input"
+    write_request_var RUN_SCRIPT "$spool_dir/run.sh"
+    write_request_var OUTPUT_DIR "$output_dir"
+    write_request_var KEEP "$keep"
+    write_request_var DETACH "yes"
+    write_request_var ARRAY_TASK "$array_task"
+    write_request_var ARRAY_RANGE "$array_range"
+    write_request_var ARRAY_ID "$array_id"
+    write_request_var EXCLUDE_LIST "$exclude_list"
+    write_request_var GPU_WANTED "$gpu_wanted"
+    write_request_var GPU_COUNT "$gpu_count"
+    write_request_var ORIGINAL_INPUT_DIR "$input_dir"
+    write_request_var ORIGINAL_RUN_SCRIPT "$run_script"
+  } > "$spool_dir/request.env"
+
+  gpu_req="${gpu_wanted:-ngpu:$gpu_count}"
+
+  history_record_launch "$job_id" "QUEUED" "-" "$node_arg" "-" \
+    "$queued_at" "-" "$local_job_dir" "-" "$keep" \
+    "$input_dir" "$run_script" "$gpu_req" "$array_range" \
+    "$array_task" "$array_id"
+
+  queue_remove_job "$job_id"
+  printf '%s\t%s\t%s\n' "$job_id" "$queued_at" "$spool_dir" >> "$QUEUE_FILE"
+
+  log_msg "Queued $job_id; dispatcher will launch it when resources are available"
+  start_dispatcher_background
+  printf '%s\n' "$job_id"
+}
+
+acquire_dispatch_lock() {
+  if mkdir "$DISPATCH_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$DISPATCH_LOCK_DIR/pid"
+    return 0
+  fi
+
+  local old_pid=""
+  if [[ -f "$DISPATCH_LOCK_DIR/pid" ]]; then
+    old_pid="$(cat "$DISPATCH_LOCK_DIR/pid" 2>/dev/null | tr -dc '0-9')"
+  fi
+
+  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+    return 1
+  fi
+
+  rm -rf "$DISPATCH_LOCK_DIR"
+
+  if mkdir "$DISPATCH_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$DISPATCH_LOCK_DIR/pid"
+    return 0
+  fi
+
+  return 1
+}
+
+release_dispatch_lock() {
+  local pid=""
+  if [[ -f "$DISPATCH_LOCK_DIR/pid" ]]; then
+    pid="$(cat "$DISPATCH_LOCK_DIR/pid" 2>/dev/null | tr -dc '0-9')"
+  fi
+
+  if [[ "$pid" == "$$" ]]; then
+    rm -rf "$DISPATCH_LOCK_DIR"
+  fi
+}
+
+start_dispatcher_background() {
+  if [[ "${SLERB_IN_DISPATCH:-no}" == "yes" ]]; then
+    return 0
+  fi
+
+  local self="${BASH_SOURCE[0]:-$0}"
+  local log_file="$SLERB_HOME/dispatch.log"
+
+  mkdir -p "$SLERB_HOME"
+
+  if [[ "$self" != */* ]]; then
+    self="$(command -v "$self" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$self" && "$self" == */* ]]; then
+    local self_dir self_base
+    self_dir="$(cd "$(dirname "$self")" 2>/dev/null && pwd || true)"
+    self_base="$(basename "$self")"
+
+    if [[ -n "$self_dir" ]]; then
+      self="$self_dir/$self_base"
+    fi
+  fi
+
+  if [[ -z "$self" || ! -f "$self" ]]; then
+    {
+      printf '[%(%Y-%m-%d %H:%M:%S)T] Could not auto-start dispatcher: unable to resolve slerb path from %s\n' \
+        -1 "${BASH_SOURCE[0]:-$0}"
+    } >> "$log_file"
+    return 0
+  fi
+
+  if [[ -f "$DISPATCH_LOCK_DIR/pid" ]]; then
+    local old_pid=""
+    old_pid="$(cat "$DISPATCH_LOCK_DIR/pid" 2>/dev/null | tr -dc '0-9')"
+
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+
+  {
+    printf '[%(%Y-%m-%d %H:%M:%S)T] Auto-starting dispatcher: %s dispatch --interval %s\n' \
+      -1 "$self" "$DISPATCH_INTERVAL"
+  } >> "$log_file"
+
+  nohup "$self" dispatch --interval "$DISPATCH_INTERVAL" >> "$log_file" 2>&1 &
+}
+
+dispatch_one_queued_job() {
+  local job_id="$1" spool_dir="$2"
+  local request_file="$spool_dir/request.env"
+
+  if [[ ! -f "$request_file" ]]; then
+    queue_remove_job "$job_id"
+    err "Queued job $job_id is missing request.env"
+    return 72
+  fi
+
+  unset JOB_ID NODE_ARG INPUT_DIR RUN_SCRIPT OUTPUT_DIR KEEP DETACH
+  unset ARRAY_TASK ARRAY_RANGE ARRAY_ID EXCLUDE_LIST GPU_WANTED GPU_COUNT
+
+  # shellcheck disable=SC1090
+  source "$request_file"
+
+  if [[ "${JOB_ID:-}" != "$job_id" ]]; then
+    err "Queued job $job_id has mismatched request.env"
+    return 72
+  fi
+
+  history_update "$job_id" "DISPATCHING" "-" "-"
+
+  set +e
+  SLERB_IN_DISPATCH=yes submit_one_job \
+    "$NODE_ARG" "$INPUT_DIR" "$RUN_SCRIPT" "$OUTPUT_DIR" \
+    "$KEEP" "yes" "0" "${ARRAY_TASK:--}" "${ARRAY_RANGE:--}" \
+    "${ARRAY_ID:--}" "${EXCLUDE_LIST:-}" "${GPU_WANTED:-}" \
+    "${GPU_COUNT:-1}" "no" "$job_id"
+  local rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    set -e
+    queue_remove_job "$job_id"
+    rm -rf "$spool_dir"
+    return 0
+  fi
+
+  if is_resource_rc "$rc"; then
+    history_update "$job_id" "QUEUED" "-" "-"
+    set +e
+    return "$rc"
+  fi
+
+  set -e
+  queue_remove_job "$job_id"
+  history_update "$job_id" "FAILED" "$rc" "$(date '+%Y-%m-%d %H:%M:%S')"
+  return "$rc"
+}
+
+dispatch_queue() {
+  local interval="${1:-$DISPATCH_INTERVAL}"
+
+  [[ "$interval" =~ ^[0-9]+$ && "$interval" -ge 1 ]] || {
+    err "dispatch interval must be a positive integer"
+    return 1
+  }
+
+  if ! acquire_dispatch_lock; then
+    log_msg "Dispatcher already running"
+    return 0
+  fi
+
+  trap release_dispatch_lock EXIT INT TERM
+
+  log_msg "Dispatcher started"
+
+  while [[ -s "$QUEUE_FILE" ]]; do
+    local job_id="" queued_at="" spool_dir="" status="" rc=0
+
+    IFS=$'\t' read -r job_id queued_at spool_dir < "$QUEUE_FILE" || break
+
+    if [[ -z "${job_id:-}" ]]; then
+      log_msg "Queue head is empty or invalid; stopping dispatcher"
+      break
+    fi
+
+    status="$(history_field "$job_id" 2)"
+
+    if [[ "$status" != "QUEUED" && "$status" != "DISPATCHING" ]]; then
+      queue_remove_job "$job_id"
+      continue
+    fi
+
+    set +e
+    dispatch_one_queued_job "$job_id" "$spool_dir"
+    rc=$?
+    set -e
+
+    if [[ $rc -eq 0 ]]; then
+      continue
+    fi
+
+    if is_resource_rc "$rc"; then
+      history_update "$job_id" "QUEUED" "-" "-"
+      log_msg "Queue head $job_id is not launchable yet; sleeping ${interval}s"
+      sleep "$interval"
+      continue
+    fi
+
+    err "Queued job $job_id failed during dispatch with exit $rc"
+  done
+
+  log_msg "Dispatcher exiting; queue is empty or inactive"
+
+  release_dispatch_lock
+  trap - EXIT INT TERM
+}
+
+submit_one_job() {
+  local node_arg="$1"
+  local input_dir="$2"
+  local run_script="$3"
+  local output_dir="$4"
+  local keep="$5"
+  local detach="$6"
+  local wait_seconds="$7"
+  local array_task="$8"
+  local array_range="$9"
+  local array_id="${10}"
+  local exclude_list="${11:-}"
+  local gpu_wanted="${12:-}"
+  local gpu_count="${13:-1}"
+  local queue_on_resource="${14:-yes}"
+  local job_id_override="${15:-}"
+
+  if [[ "$node_arg" != "--auto" ]] && is_excluded_node "$node_arg" "$exclude_list"; then
+    err "Target node '$node_arg' is excluded by --exclude"
+    return 1
+  fi
+
+  [[ "$gpu_count" =~ ^[0-9]+$ && "$gpu_count" -ge 1 ]] || {
+    err "Invalid GPU count requested: $gpu_count"
+    return 1
+  }
+
+  input_dir="$(cd "$input_dir" && pwd)" || return 1
+  run_script="$(cd "$(dirname "$run_script")" && pwd)/$(basename "$run_script")" || return 1
+  output_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)" || return 1
+
+  [[ -d "$input_dir" ]] || { err "input_dir is not a directory: $input_dir"; return 1; }
+  [[ -f "$run_script" ]] || { err "run_script is not a file: $run_script"; return 1; }
+
+  local start_time job_id node_line name user host env_file tags target setup_out rc remote_dir work_dir gpu_ids local_job_dir
+
+  start_time="$(date +%Y%m%d-%H%M%S)"
+
+  if [[ -n "$job_id_override" ]]; then
+    job_id="$job_id_override"
+  elif [[ "$array_task" != "-" ]]; then
+    job_id="slerb-${start_time}-$$-task${array_task}"
+  else
+    job_id="slerb-${start_time}-$$"
+  fi
+
+  if [[ "${SLERB_IN_DISPATCH:-no}" != "yes" && "$queue_on_resource" == "yes" ]] && queue_has_jobs; then
+    queue_job "$job_id" "$node_arg" "$input_dir" "$run_script" \
+      "$output_dir" "$keep" "$detach" "$array_task" "$array_range" \
+      "$array_id" "$exclude_list" "$gpu_wanted" "$gpu_count"
+    return $?
+  fi
+
+  while true; do
+    if [[ "$node_arg" == "--auto" ]]; then
+      name="$(choose_auto_node "$exclude_list" "$gpu_count" || true)"
+      if [[ -z "$name" ]]; then
+        if [[ "$wait_seconds" -gt 0 ]]; then
+          if [[ -n "$exclude_list" ]]; then
+            log_msg "No node with $gpu_count free non-excluded GPU(s) found; excluded=[$exclude_list]; waiting ${wait_seconds}s"
+          else
+            log_msg "No node with $gpu_count free GPU(s) found; waiting ${wait_seconds}s"
+          fi
+          sleep "$wait_seconds"
+          continue
+        fi
+
+        if [[ "$queue_on_resource" == "yes" ]]; then
+          queue_job "$job_id" "$node_arg" "$input_dir" "$run_script" \
+            "$output_dir" "$keep" "$detach" "$array_task" "$array_range" \
+            "$array_id" "$exclude_list" "$gpu_wanted" "$gpu_count"
+          return $?
+        fi
+
+        if [[ "${SLERB_IN_DISPATCH:-no}" == "yes" ]]; then
+          set +e
+          return 81
+        fi
+
+        if [[ -n "$exclude_list" ]]; then
+          err "No node with $gpu_count free non-excluded GPU(s) found; excluded=[$exclude_list]"
+        else
+          err "No node with $gpu_count free GPU(s) found"
+        fi
+        return 81
+      fi
+    else
+      name="$node_arg"
+    fi
+
+    if ! node_line="$(get_node "$name")"; then
+      err "Unknown node: $name"
+      return 1
+    fi
+
+    IFS=$'\t' read -r name user host env_file tags <<< "$node_line"
+
+    env_file="${env_file:-$DEFAULT_ENV_FILE}"
+    target="$(ssh_target "$user" "$host")"
+
+    set +e
+    setup_out="$(remote_setup_job \
+      "$target" "$env_file" "$job_id" "$gpu_wanted" "$gpu_count" 2>&1)"
+    rc=$?
+    set -e
+
+    if [[ $rc -eq 0 ]]; then
+      break
+    fi
+
+    if [[ $rc -eq 61 && "$wait_seconds" -gt 0 ]]; then
+      log_msg "$name does not have $gpu_count free GPU(s); waiting ${wait_seconds}s"
+      sleep "$wait_seconds"
+      continue
+    fi
+
+    if [[ $rc -eq 63 && "$wait_seconds" -gt 0 ]]; then
+      if [[ -n "$gpu_wanted" ]]; then
+        log_msg "$name requested GPU(s) $gpu_wanted not free; waiting ${wait_seconds}s"
+      else
+        log_msg "$name GPU allocation race or busy GPU(s); waiting ${wait_seconds}s"
+      fi
+      sleep "$wait_seconds"
+      continue
+    fi
+
+    if [[ $rc -eq 64 && "$wait_seconds" -gt 0 ]]; then
+      log_msg "$name is reserved; waiting ${wait_seconds}s"
+      sleep "$wait_seconds"
+      continue
+    fi
+
+    if is_resource_rc "$rc"; then
+      if [[ "$queue_on_resource" == "yes" ]]; then
+        queue_job "$job_id" "$node_arg" "$input_dir" "$run_script" \
+          "$output_dir" "$keep" "$detach" "$array_task" "$array_range" \
+          "$array_id" "$exclude_list" "$gpu_wanted" "$gpu_count"
+        return $?
+      fi
+
+      if [[ "${SLERB_IN_DISPATCH:-no}" == "yes" ]]; then
+        set +e
+        return "$rc"
+      fi
+
+      err "Remote setup failed on $name: $setup_out"
+      return "$rc"
+    fi
+
+    if [[ "$node_arg" == "--auto" && "$wait_seconds" -gt 0 ]]; then
+      log_msg "Auto node race or setup failure on $name: $setup_out; waiting ${wait_seconds}s"
+      sleep "$wait_seconds"
+      continue
+    fi
+
+    err "Remote setup failed on $name: $setup_out"
+    return "$rc"
+  done
+
+  remote_dir="$(printf '%s\n' "$setup_out" | kv_get REMOTE_DIR)"
+  work_dir="$(printf '%s\n' "$setup_out" | kv_get WORK_DIR)"
+  gpu_ids="$(printf '%s\n' "$setup_out" | kv_get GPU_IDS)"
+  gpu_ids="${gpu_ids:-$(printf '%s\n' "$setup_out" | kv_get GPU_ID)}"
+  local_job_dir="$output_dir/$job_id"
+
+  mkdir -p "$local_job_dir"
+
+  log_msg "Staging $job_id to $name GPU(s) $gpu_ids"
+
+  set +e
+  rsync_to_remote "$input_dir/" "$target" "$work_dir/"
+  rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    rsync -azcL "$run_script" "$target:$work_dir/run.sh"
+    rc=$?
+  fi
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    remote_abort_job "$target" "$env_file" "$remote_dir"
+    err "Staging failed for $job_id"
+    return "$rc"
+  fi
+
+  history_record_launch "$job_id" "STAGED" "-" "$name" "$target" \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "-" "$local_job_dir" \
+    "$remote_dir" "$keep" "$input_dir" "$run_script" "$gpu_ids" \
+    "$array_range" "$array_task" "$array_id"
+
+  if [[ "$detach" == "yes" ]]; then
+    remote_run_detached "$target" "$env_file" "$remote_dir" "$gpu_ids" "$job_id" "$array_task" "$array_range" "$array_id"
+    history_update "$job_id" "DETACHED" "-" "-"
+    log_msg "Launched detached: $job_id on $name GPU(s) $gpu_ids"
+    printf '%s\n' "$job_id"
+    return 0
+  fi
+
+  set +e
+  remote_run_foreground "$target" "$env_file" "$remote_dir" "$gpu_ids" "$job_id" "$array_task" "$array_range" "$array_id"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    history_update "$job_id" "DONE" "$rc" "$(date '+%Y-%m-%d %H:%M:%S')"
+  else
+    history_update "$job_id" "FAILED" "$rc" "$(date '+%Y-%m-%d %H:%M:%S')"
+  fi
+
+  fetch_job "$job_id" "no" || true
+
+  return "$rc"
+}
+
+submit_array() {
+  local node_arg="$1"
+  local input_dir="$2"
+  local run_script="$3"
+  local output_dir="$4"
+  local keep="$5"
+  local wait_seconds="$6"
+  local array_range="$7"
+  local exclude_list="${8:-}"
+  local gpu_wanted="${9:-}"
+  local gpu_count="${10:-1}"
+
+  local array_id task
+  array_id="array-$(date +%Y%m%d-%H%M%S)-$$"
+
+  if [[ -n "$exclude_list" ]]; then
+    log_msg "Launching array $array_id range=$array_range excluded=[$exclude_list] gpu_count=$gpu_count gpu_wanted=${gpu_wanted:--}"
+  else
+    log_msg "Launching array $array_id range=$array_range gpu_count=$gpu_count gpu_wanted=${gpu_wanted:--}"
+  fi
+
+  expand_array_range "$array_range" | while read -r task; do
+    submit_one_job \
+      "$node_arg" "$input_dir" "$run_script" "$output_dir" \
+      "$keep" "yes" "$wait_seconds" "$task" "$array_range" \
+      "$array_id" "$exclude_list" "$gpu_wanted" "$gpu_count"
+  done
+
+  log_msg "Array launch complete: $array_id"
+}
+
+remote_job_done_check() {
+  local target="$1" remote_dir="$2"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- "$remote_dir" <<'REMOTE'
+set -u
+
+remote_dir="$1"
+
+if [[ ! -d "$remote_dir" ]]; then
+  echo "MISSING"
+  exit 76
+fi
+
+if [[ -f "$remote_dir/.slerb_state" ]]; then
+  source "$remote_dir/.slerb_state" >/dev/null 2>&1 || true
+
+  if [[ "${STATUS:-}" == "CANCELED" ]]; then
+    echo "CANCELED"
+    exit 0
+  fi
+fi
+
+if [[ -s "$remote_dir/exit_code" ]]; then
+  cat "$remote_dir/exit_code"
+  exit 0
+fi
+
+echo "RUNNING"
+exit 75
+REMOTE
+}
+
+remote_cancel_job() {
+  local target="$1" remote_dir="$2"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- "$remote_dir" <<'REMOTE'
+set -u
+
+remote_dir="$1"
+
+if [[ ! -d "$remote_dir" ]]; then
+  echo "MISSING"
+  exit 76
+fi
+
+LOCK_DIR=""
+LOCK_DIRS=""
+if [[ -f "$remote_dir/.slerb_state" ]]; then
+  source "$remote_dir/.slerb_state" >/dev/null 2>&1 || true
+fi
+
+cleanup_slerb_locks() {
+  local dirs="${LOCK_DIRS:-${LOCK_DIR:-}}"
+  local dir
+
+  IFS=',' read -ra _slerb_cleanup_lock_dirs <<< "$dirs"
+
+  for dir in "${_slerb_cleanup_lock_dirs[@]}"; do
+    [[ -n "$dir" ]] && rm -rf "$dir"
+  done
+}
+
+{
+  grep -v '^STATUS=' "$remote_dir/.slerb_state" 2>/dev/null | \
+    grep -v '^END_TIME=' || true
+  echo "STATUS=CANCELED"
+  echo "END_TIME=$(date -Is)"
+} > "$remote_dir/.slerb_state.tmp"
+
+mv "$remote_dir/.slerb_state.tmp" "$remote_dir/.slerb_state"
+
+echo "130" > "$remote_dir/exit_code"
+
+{
+  printf '\nSLERB job canceled: %s\n' "$(date -Is)"
+} >> "$remote_dir/job.log" 2>/dev/null || true
+
+pid=""
+pgid=""
+
+if [[ -s "$remote_dir/pid" ]]; then
+  pid="$(cat "$remote_dir/pid" | tr -dc '0-9')"
+fi
+
+if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+fi
+
+job_pids() {
+  local self self_pgid wd gpu_uuids
+
+  self="$$"
+  self_pgid="$(ps -o pgid= -p "$self" 2>/dev/null | tr -d ' ')"
+  wd="${WORK_DIR:-$remote_dir/work}"
+
+  ps -eo pid=,ppid=,pgid=,sid=,cmd= | awk \
+    -v rd="$remote_dir" \
+    -v wd="$wd" \
+    -v self="$self" \
+    -v self_pgid="$self_pgid" '
+      {
+        pid=$1
+        ppid=$2
+        pgid=$3
+        cmd=$0
+      }
+
+      pid == self {next}
+      ppid == self {next}
+      pgid == self_pgid {next}
+
+      cmd ~ /bash -s --/ {next}
+      cmd ~ /awk -v rd=/ {next}
+      cmd ~ /awk -v wd=/ {next}
+      cmd ~ /ps -eo/ {next}
+
+      index(cmd, rd) || index(cmd, wd) {
+        print pid
+      }
+    '
+
+  gpu_uuids="${GPU_UUIDS:-${GPU_UUID:-}}"
+
+  if [[ -n "$gpu_uuids" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-compute-apps=pid,gpu_uuid \
+      --format=csv,noheader,nounits 2>/dev/null | awk -F',' \
+      -v uuids="$gpu_uuids" '
+        BEGIN {
+          n = split(uuids, uuid_list, ",")
+          for (i = 1; i <= n; i++) {
+            wanted[uuid_list[i]] = 1
+          }
+        }
+
+        {
+          pid=$1
+          gpu_uuid=$2
+
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", pid)
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", gpu_uuid)
+
+          if (wanted[gpu_uuid]) {
+            print pid
+          }
+        }
+      '
+  fi
+}
+
+kill_group() {
+  local sig="$1"
+
+  if [[ -n "$pgid" ]]; then
+    kill "-$sig" -- "-$pgid" 2>/dev/null || true
+  elif [[ -n "$pid" ]]; then
+    kill "-$sig" "$pid" 2>/dev/null || true
+  fi
+}
+
+kill_matches() {
+  local sig="$1"
+  local pids
+
+  pids="$(job_pids | tr '\n' ' ')"
+  [[ -z "$pids" ]] && return 0
+
+  # shellcheck disable=SC2086
+  kill "-$sig" $pids 2>/dev/null || true
+}
+
+kill_group TERM
+kill_matches TERM
+
+for _ in 1 2 3 4 5; do
+  sleep 1
+  [[ -z "$(job_pids)" ]] && break
+done
+
+if [[ -n "$(job_pids)" ]]; then
+  kill_group KILL
+  kill_matches KILL
+  sleep 1
+fi
+
+if [[ -n "$(job_pids)" ]]; then
+  echo "FAILED_TO_KILL"
+  job_pids
+  exit 70
+fi
+
+cleanup_slerb_locks
+
+echo "CANCELED"
+REMOTE
+}
+
+remote_reserve_resource() {
+  local target="$1" env_file="$2" scope="$3" gpu_wanted="$4" reason="$5"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- \
+    "$env_file" "$scope" "$gpu_wanted" "$reason" <<'REMOTE'
+set -euo pipefail
+
+env_file="$1"
+scope="$2"
+gpu_wanted="${3:-}"
+reason="${4:-reserved}"
+
+if [[ -f "$env_file" ]]; then
+  source "$env_file"
+fi
+
+SLERB_SCRATCH="${SLERB_SCRATCH:-$HOME/slerb}"
+SLERB_LOCKS_ROOT="${SLERB_LOCKS_ROOT:-$SLERB_SCRATCH/locks}"
+
+mkdir -p "$SLERB_LOCKS_ROOT"
+
+reason="${reason//$'\t'/ }"
+reason="${reason//$'\n'/ }"
+actor="${USER:-unknown}"
+host="$(hostname -s 2>/dev/null || hostname)"
+created="$(date -Is)"
+
+write_info() {
+  local lock_dir="$1" lock_scope="$2" gpu_id="${3:-}" gpu_uuid="${4:-}"
+
+  {
+    printf 'type=reservation\n'
+    printf 'scope=%s\n' "$lock_scope"
+    [[ -n "$gpu_id" ]] && printf 'gpu_id=%s\n' "$gpu_id"
+    [[ -n "$gpu_uuid" ]] && printf 'gpu_uuid=%s\n' "$gpu_uuid"
+    printf 'user=%s\n' "$actor"
+    printf 'host=%s\n' "$host"
+    printf 'created=%s\n' "$created"
+    printf 'reason=%s\n' "$reason"
+  } > "$lock_dir/info"
+}
+
+case "$scope" in
+  host)
+    lock_dir="$SLERB_LOCKS_ROOT/host.lock"
+
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+      echo "RESERVE_EXISTS=host"
+      exit 65
+    fi
+
+    write_info "$lock_dir" "host"
+    echo "RESERVED_HOST"
+    exit 0
+    ;;
+
+  gpu)
+    [[ -n "$gpu_wanted" ]] || {
+      echo "MISSING_GPU"
+      exit 64
+    }
+    ;;
+
+  *)
+    echo "BAD_SCOPE=$scope"
+    exit 64
+    ;;
+esac
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "NO_NVIDIA_GPU"
+  exit 60
+fi
+
+gpu_uuid="$(
+  nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits | \
+    awk -F',' -v wanted="$gpu_wanted" '
+      {
+        idx=$1
+        uuid=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", idx)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", uuid)
+        if (idx == wanted) {print uuid; exit}
+      }
+    '
+)"
+
+if [[ -z "$gpu_uuid" ]]; then
+  echo "NO_SUCH_GPU=$gpu_wanted"
+  exit 66
+fi
+
+lock_dir="$SLERB_LOCKS_ROOT/gpu-$gpu_wanted.lock"
+
+if ! mkdir "$lock_dir" 2>/dev/null; then
+  echo "RESERVE_EXISTS=gpu-$gpu_wanted"
+  exit 65
+fi
+
+write_info "$lock_dir" "gpu" "$gpu_wanted" "$gpu_uuid"
+echo "RESERVED_GPU=$gpu_wanted"
+REMOTE
+}
+
+remote_release_resource() {
+  local target="$1" env_file="$2" gpu_wanted="${3:-}"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- \
+    "$env_file" "$gpu_wanted" <<'REMOTE'
+set -euo pipefail
+
+env_file="$1"
+gpu_wanted="${2:-}"
+
+if [[ -f "$env_file" ]]; then
+  source "$env_file"
+fi
+
+SLERB_SCRATCH="${SLERB_SCRATCH:-$HOME/slerb}"
+SLERB_LOCKS_ROOT="${SLERB_LOCKS_ROOT:-$SLERB_SCRATCH/locks}"
+
+if [[ -z "$gpu_wanted" ]]; then
+  lock_dir="$SLERB_LOCKS_ROOT/host.lock"
+  label="host"
+else
+  lock_dir="$SLERB_LOCKS_ROOT/gpu-$gpu_wanted.lock"
+  label="gpu-$gpu_wanted"
+fi
+
+if [[ ! -d "$lock_dir" ]]; then
+  echo "NOT_RESERVED=$label"
+  exit 66
+fi
+
+lock_type=""
+if [[ -f "$lock_dir/info" ]]; then
+  lock_type="$(awk -F= '$1=="type" {print $2; exit}' "$lock_dir/info")"
+fi
+
+if [[ "$lock_type" != "reservation" ]]; then
+  echo "NOT_RESERVATION=$label"
+  exit 65
+fi
+
+rm -rf "$lock_dir"
+echo "RELEASED=$label"
+REMOTE
+}
+
+reserve_resource() {
+  local node="$1" gpu_wanted="${2:-}" reason="${3:-reserved}"
+  local node_line name user host env_file tags target out rc
+
+  if ! node_line="$(get_node "$node")"; then
+    err "Unknown node: $node"
+    return 1
+  fi
+
+  IFS=$'\t' read -r name user host env_file tags <<< "$node_line"
+  env_file="${env_file:-$DEFAULT_ENV_FILE}"
+  target="$(ssh_target "$user" "$host")"
+
+  local reserve_scope
+
+  if [[ -n "$gpu_wanted" ]]; then
+    reserve_scope="gpu"
+  else
+    reserve_scope="host"
+  fi
+
+  set +e
+  out="$(remote_reserve_resource \
+    "$target" "$env_file" "$reserve_scope" "$gpu_wanted" "$reason" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    if [[ -n "$gpu_wanted" ]]; then
+      log_msg "Reserved $node GPU $gpu_wanted"
+    else
+      log_msg "Reserved $node"
+    fi
+    return 0
+  fi
+
+  err "Could not reserve $node: $out"
+  return "$rc"
+}
+
+release_resource() {
+  local node="$1" gpu_wanted="${2:-}"
+  local node_line name user host env_file tags target out rc
+
+  if ! node_line="$(get_node "$node")"; then
+    err "Unknown node: $node"
+    return 1
+  fi
+
+  IFS=$'\t' read -r name user host env_file tags <<< "$node_line"
+  env_file="${env_file:-$DEFAULT_ENV_FILE}"
+  target="$(ssh_target "$user" "$host")"
+
+  set +e
+  out="$(remote_release_resource \
+    "$target" "$env_file" "$gpu_wanted" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    if [[ -n "$gpu_wanted" ]]; then
+      log_msg "Released $node GPU $gpu_wanted"
+    else
+      log_msg "Released $node"
+    fi
+    return 0
+  fi
+
+  err "Could not release $node: $out"
+  return "$rc"
+}
+
+remote_cleanup_job() {
+  local target="$1" remote_dir="$2"
+
+  ssh "${SSH_OPTS[@]}" "$target" bash -s -- "$remote_dir" <<'REMOTE' || true
+set -u
+
+remote_dir="$1"
+
+cleanup_slerb_locks() {
+  local dirs="${LOCK_DIRS:-${LOCK_DIR:-}}"
+  local dir
+
+  IFS=',' read -ra _slerb_cleanup_lock_dirs <<< "$dirs"
+
+  for dir in "${_slerb_cleanup_lock_dirs[@]}"; do
+    [[ -n "$dir" ]] && rm -rf "$dir"
+  done
+}
+
+if [[ -f "$remote_dir/.slerb_state" ]]; then
+  source "$remote_dir/.slerb_state" >/dev/null 2>&1 || true
+  cleanup_slerb_locks
+fi
+
+rm -rf "$remote_dir"
+REMOTE
+}
+
+fetch_job() {
+  local job_id="$1" force_clean="${2:-no}"
+  local status exit_code node target start_time end_time local_dir remote_dir keep input_dir run_script gpu_id array_range array_task array_id
+  local line
+
+  line="$(awk -F'\t' -v id="$job_id" '$1 == id {print; found=1} END {if (!found) exit 1}' "$JOBS_FILE")" || {
+    err "Unknown job_id: $job_id"
+    return 1
+  }
+
+  IFS=$'\t' read -r job_id status exit_code node target start_time end_time local_dir remote_dir keep input_dir run_script gpu_id array_range array_task array_id <<< "$line"
+
+  if [[ -z "$remote_dir" || "$remote_dir" == "-" ]]; then
+    err "No remote directory recorded for $job_id"
+    return 1
+  fi
+
+  local remote_ec rc
+
+  set +e
+  remote_ec="$(remote_job_done_check "$target" "$remote_dir" 2>/dev/null)"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 75 ]]; then
+    history_update "$job_id" "RUNNING" "-" "-"
+    log_msg "$job_id still running; not fetching partial results"
+    return 75
+  elif [[ $rc -eq 76 ]]; then
+    history_update "$job_id" "MISSING" "-" "$(date '+%Y-%m-%d %H:%M:%S')"
+    err "$job_id remote directory is missing"
+    return 76
+  elif [[ $rc -ne 0 ]]; then
+    err "Could not check remote job status for $job_id"
+    return "$rc"
+  fi
+
+  remote_ec="$(trim "$remote_ec")"
+
+  log_msg "Fetching $job_id from $node"
+  rsync_from_remote "$target" "$remote_dir" "$local_dir"
+
+  if [[ "$remote_ec" == "CANCELED" ]]; then
+    history_update "$job_id" "CANCELED" "130" \
+      "$(date '+%Y-%m-%d %H:%M:%S')"
+  elif [[ "$remote_ec" == "0" ]]; then
+    history_update "$job_id" "DONE" "$remote_ec" "$(date '+%Y-%m-%d %H:%M:%S')"
+  else
+    history_update "$job_id" "FAILED" "$remote_ec" "$(date '+%Y-%m-%d %H:%M:%S')"
+  fi
+
+  if [[ "$force_clean" == "yes" || ( "$keep" != "yes" && "$remote_ec" == "0" ) ]]; then
+    log_msg "Cleaning remote job directory for $job_id"
+    remote_cleanup_job "$target" "$remote_dir"
+  fi
+
+  printf '%s\n' "$local_dir"
+}
+
+cancel_job() {
+  local job_id="$1"
+  local line status exit_code node target start_time end_time
+  local local_dir remote_dir keep input_dir run_script gpu_id
+  local array_range array_task array_id rc cancel_out
+
+  line="$(awk -F'\t' -v id="$job_id" '
+    $1 == id {print; found=1} END {if (!found) exit 1}
+  ' "$JOBS_FILE")" || {
+    err "Unknown job_id: $job_id"
+    return 1
+  }
+
+  IFS=$'\t' read -r job_id status exit_code node target start_time \
+    end_time local_dir remote_dir keep input_dir run_script gpu_id \
+    array_range array_task array_id <<< "$line"
+
+  if [[ -z "$remote_dir" || "$remote_dir" == "-" ]]; then
+    if [[ "$status" == "QUEUED" || "$status" == "DISPATCHING" ]]; then
+      local spool_dir
+      spool_dir="$(queue_spool_dir "$job_id")"
+      queue_remove_job "$job_id"
+      [[ -n "$spool_dir" ]] && rm -rf "$spool_dir"
+      history_update "$job_id" "CANCELED" "130"         "$(date '+%Y-%m-%d %H:%M:%S')"
+      log_msg "Canceled queued job $job_id"
+      return 0
+    fi
+
+    err "No remote directory recorded for $job_id"
+    return 1
+  fi
+
+  set +e
+  cancel_out="$(remote_cancel_job "$target" "$remote_dir" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    history_update "$job_id" "CANCELED" "130" \
+      "$(date '+%Y-%m-%d %H:%M:%S')"
+    log_msg "Canceled $job_id on $node"
+    return 0
+  fi
+
+  if [[ $rc -eq 76 ]]; then
+    history_update "$job_id" "MISSING" "-" \
+      "$(date '+%Y-%m-%d %H:%M:%S')"
+    err "$job_id remote directory is missing"
+    return 76
+  fi
+
+  err "Could not cancel $job_id: $cancel_out"
+  return "$rc"
+}
+
+restart_job() {
+  local job_id="$1" force="${2:-no}"
+  local line status exit_code node target start_time end_time
+  local local_dir remote_dir keep input_dir run_script gpu_id
+  local array_range array_task array_id
+
+  line="$(awk -F'\t' -v id="$job_id" '
+    $1 == id {print; found=1} END {if (!found) exit 1}
+  ' "$JOBS_FILE")" || {
+    err "Unknown job_id: $job_id"
+    return 1
+  }
+
+  IFS=$'\t' read -r job_id status exit_code node target start_time \
+    end_time local_dir remote_dir keep input_dir run_script gpu_id \
+    array_range array_task array_id <<< "$line"
+
+  array_range="${array_range:--}"
+  array_task="${array_task:--}"
+  array_id="${array_id:--}"
+
+  if [[ -z "$gpu_id" || "$gpu_id" == "-" ]]; then
+    err "No GPU recorded for $job_id; cannot restart"
+    return 1
+  fi
+
+  local gpu_ids gpu_count
+  gpu_ids="$(normalize_gpu_list "$gpu_id")" || {
+    err "Recorded GPU for $job_id is not a physical GPU index list: $gpu_id"
+    return 1
+  }
+  gpu_count="$(csv_count "$gpu_ids")"
+
+  local node_line name user host env_file tags
+
+  if ! node_line="$(get_node "$node")"; then
+    err "Unknown node in job history for $job_id: $node"
+    return 1
+  fi
+
+  IFS=$'\t' read -r name user host env_file tags <<< "$node_line"
+  env_file="${env_file:-$DEFAULT_ENV_FILE}"
+  target="$(ssh_target "$user" "$host")"
+
+  local prepare_out setup_out rc work_dir
+
+  set +e
+  prepare_out="$(remote_prepare_restart \
+    "$target" "$env_file" "$remote_dir" "$job_id" "$gpu_ids" "$force" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    remote_dir="$(printf '%s\n' "$prepare_out" | kv_get REMOTE_DIR)"
+    work_dir="$(printf '%s\n' "$prepare_out" | kv_get WORK_DIR)"
+    gpu_ids="$(printf '%s\n' "$prepare_out" | kv_get GPU_IDS)"
+    gpu_ids="${gpu_ids:-$(printf '%s\n' "$prepare_out" | kv_get GPU_ID)}"
+  elif [[ $rc -eq 76 || $rc -eq 78 ]]; then
+    [[ -d "$input_dir" ]] || {
+      err "Cannot restage $job_id; input_dir is missing: $input_dir"
+      return 1
+    }
+
+    [[ -f "$run_script" ]] || {
+      err "Cannot restage $job_id; run_script is missing: $run_script"
+      return 1
+    }
+
+    if [[ $rc -eq 78 && -n "$remote_dir" && "$remote_dir" != "-" ]]; then
+      remote_abort_job "$target" "$env_file" "$remote_dir"
+    fi
+
+    set +e
+    setup_out="$(remote_setup_job \
+      "$target" "$env_file" "$job_id" "$gpu_ids" "$gpu_count" 2>&1)"
+    rc=$?
+    set -e
+
+    if [[ $rc -ne 0 ]]; then
+      err "Remote restart setup failed for $job_id on $node: $setup_out"
+      return "$rc"
+    fi
+
+    remote_dir="$(printf '%s\n' "$setup_out" | kv_get REMOTE_DIR)"
+    work_dir="$(printf '%s\n' "$setup_out" | kv_get WORK_DIR)"
+    gpu_ids="$(printf '%s\n' "$setup_out" | kv_get GPU_IDS)"
+    gpu_ids="${gpu_ids:-$(printf '%s\n' "$setup_out" | kv_get GPU_ID)}"
+
+    log_msg "Restaging $job_id to $node GPU(s) $gpu_ids"
+
+    set +e
+    rsync_to_remote "$input_dir/" "$target" "$work_dir/"
+    rc=$?
+
+    if [[ $rc -eq 0 ]]; then
+      rsync -azcL "$run_script" "$target:$work_dir/run.sh"
+      rc=$?
+    fi
+    set -e
+
+    if [[ $rc -ne 0 ]]; then
+      remote_abort_job "$target" "$env_file" "$remote_dir"
+      err "Restart staging failed for $job_id"
+      return "$rc"
+    fi
+  else
+    err "Could not prepare restart for $job_id on $node: $prepare_out"
+    return "$rc"
+  fi
+
+  set +e
+  prepare_out="$(remote_run_detached \
+    "$target" "$env_file" "$remote_dir" "$gpu_ids" "$job_id" \
+    "$array_task" "$array_range" "$array_id" 2>&1)"
+  rc=$?
+  set -e
+
+  if [[ $rc -ne 0 ]]; then
+    err "Could not relaunch $job_id on $node: $prepare_out"
+    return "$rc"
+  fi
+
+  history_restart_update "$job_id" "DETACHED" "-" "$target" \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "-" "$remote_dir" "$gpu_ids"
+
+  log_msg "Restarted detached: $job_id on $node GPU(s) $gpu_ids"
+  printf '%s\n' "$job_id"
+}
+
+fetch_all_done() {
+  local fetched=0 skipped=0 failed=0
+  local job_id status target remote_dir remote_ec rc
+
+  while IFS=$'\t' read -r job_id status _exit_code _node target _start _end _local remote_dir _keep _input _script _gpu _range _task _array; do
+    [[ -z "${job_id:-}" ]] && continue
+
+    case "$status" in
+      DETACHED|RUNNING|STAGED) ;;
+      *) continue ;;
+    esac
+
+    [[ -z "${remote_dir:-}" || "$remote_dir" == "-" ]] && continue
+
+    set +e
+    remote_ec="$(remote_job_done_check "$target" "$remote_dir" 2>/dev/null)"
+    rc=$?
+    set -e
+
+    if [[ $rc -eq 0 ]]; then
+      if fetch_job "$job_id" "no"; then
+        fetched=$((fetched + 1))
+      else
+        failed=$((failed + 1))
+      fi
+    elif [[ $rc -eq 75 ]]; then
+      skipped=$((skipped + 1))
+    else
+      log_msg "Skipping $job_id; status check failed or remote missing"
+      failed=$((failed + 1))
+    fi
+  done < "$JOBS_FILE"
+
+  log_msg "fetch --all-done complete: fetched=$fetched still_running=$skipped failed_checks=$failed"
+}
+
+show_log() {
+  local job_id="$1"
+  local local_dir remote_dir target
+
+  local_dir="$(history_field "$job_id" 8)"
+  target="$(history_field "$job_id" 5)"
+  remote_dir="$(history_field "$job_id" 9)"
+
+  if [[ -n "$local_dir" && -f "$local_dir/job.log" ]]; then
+    cat "$local_dir/job.log"
+  elif [[ -n "$target" && -n "$remote_dir" ]]; then
+    ssh "${SSH_OPTS[@]}" "$target" "cat $(remote_quote "$remote_dir/job.log") 2>/dev/null || true"
+  else
+    err "Unknown job_id or no log found: $job_id"
+    return 1
+  fi
+}
+
+main() {
+  local cmd="${1:-}"
+
+  [[ -z "$cmd" ]] && {
+    usage
+    exit 1
+  }
+
+  shift || true
+
+  case "$cmd" in
+    status)
+      status_all
+      ;;
+
+    validate)
+      validate_nodes "${1:-$NODES_FILE}"
+      ;;
+
+    jobs)
+      show_jobs "${1:-30}"
+      ;;
+
+    queue)
+      show_queue
+      ;;
+
+    dispatch)
+      local interval="$DISPATCH_INTERVAL"
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --interval)
+            interval="${2:?missing seconds after --interval}"
+            shift 2
+            ;;
+          --help|-h)
+            usage
+            exit 0
+            ;;
+          *)
+            usage
+            exit 1
+            ;;
+        esac
+      done
+
+      dispatch_queue "$interval"
+      ;;
+
+    arrays)
+      show_arrays
+      ;;
+
+    log)
+      [[ $# -eq 1 ]] || {
+        usage
+        exit 1
+      }
+
+      show_log "$1"
+      ;;
+
+    cancel)
+      [[ $# -eq 1 ]] || {
+        usage
+        exit 1
+      }
+
+      cancel_job "$1"
+      ;;
+
+    restart)
+      local force="no"
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --force)
+            force="yes"
+            shift
+            ;;
+          --help|-h)
+            usage
+            exit 0
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+
+      [[ $# -eq 1 ]] || {
+        usage
+        exit 1
+      }
+
+      restart_job "$1" "$force"
+      ;;
+
+    reserve)
+      local node="${1:-}"
+      local gpu_wanted="" reason="reserved"
+
+      [[ -n "$node" ]] || {
+        usage
+        exit 1
+      }
+      shift
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --gpu)
+            gpu_wanted="${2:?missing GPU id after --gpu}"
+            shift 2
+            ;;
+          --reason)
+            reason="${2:?missing text after --reason}"
+            shift 2
+            ;;
+          --help|-h)
+            usage
+            exit 0
+            ;;
+          *)
+            usage
+            exit 1
+            ;;
+        esac
+      done
+
+      if [[ -n "$gpu_wanted" ]]; then
+        [[ "$gpu_wanted" =~ ^[0-9]+$ ]] || {
+          err "--gpu expects a physical GPU index"
+          exit 1
+        }
+      fi
+
+      reserve_resource "$node" "$gpu_wanted" "$reason"
+      ;;
+
+    release)
+      local node="${1:-}"
+      local gpu_wanted=""
+
+      [[ -n "$node" ]] || {
+        usage
+        exit 1
+      }
+      shift
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --gpu)
+            gpu_wanted="${2:?missing GPU id after --gpu}"
+            shift 2
+            ;;
+          --help|-h)
+            usage
+            exit 0
+            ;;
+          *)
+            usage
+            exit 1
+            ;;
+        esac
+      done
+
+      if [[ -n "$gpu_wanted" ]]; then
+        [[ "$gpu_wanted" =~ ^[0-9]+$ ]] || {
+          err "--gpu expects a physical GPU index"
+          exit 1
+        }
+      fi
+
+      release_resource "$node" "$gpu_wanted"
+      ;;
+
+    fetch)
+      local clean="no" all_done="no"
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --clean)
+            clean="yes"
+            shift
+            ;;
+          --all-done)
+            all_done="yes"
+            shift
+            ;;
+          --help|-h)
+            usage
+            exit 0
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+
+      if [[ "$all_done" == "yes" ]]; then
+        fetch_all_done
+      else
+        [[ $# -eq 1 ]] || {
+          usage
+          exit 1
+        }
+
+        fetch_job "$1" "$clean"
+      fi
+      ;;
+
+    submit)
+      local keep="no"
+      local detach="no"
+      local wait_seconds=0
+      local array_range=""
+      local exclude_list=""
+      local gpu_wanted=""
+      local ngpu=""
+
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --keep)
+            keep="yes"
+            shift
+            ;;
+          --detach)
+            detach="yes"
+            shift
+            ;;
+          --wait)
+            wait_seconds="${2:?missing seconds after --wait}"
+            shift 2
+            ;;
+          --gpu)
+            gpu_wanted="${2:?missing GPU id after --gpu}"
+            shift 2
+            ;;
+          --ngpu)
+            ngpu="${2:?missing GPU count after --ngpu}"
+            shift 2
+            ;;
+          --array)
+            array_range="${2:?missing range after --array}"
+            shift 2
+            ;;
+          --exclude)
+            exclude_list="$(append_exclude "$exclude_list" "${2:?missing node name after --exclude}")"
+            shift 2
+            ;;
+          --help|-h)
+            usage
+            exit 0
+            ;;
+          *)
+            break
+            ;;
+        esac
+      done
+
+      [[ $# -eq 4 ]] || {
+        usage
+        exit 1
+      }
+
+      local node_arg="$1" input_dir="$2" run_script="$3" output_dir="$4"
+
+      if [[ -n "$gpu_wanted" && -n "$ngpu" ]]; then
+        err "--gpu and --ngpu cannot be used together"
+        exit 1
+      fi
+
+      if [[ -n "$gpu_wanted" ]]; then
+        gpu_wanted="$(normalize_gpu_list "$gpu_wanted")" || {
+          err "--gpu expects one physical GPU index or a comma-separated list of unique physical GPU indexes"
+          exit 1
+        }
+
+        [[ "$node_arg" != "--auto" ]] || {
+          err "--gpu cannot be used with --auto; use --ngpu with --auto"
+          exit 1
+        }
+
+        ngpu="$(csv_count "$gpu_wanted")"
+      else
+        ngpu="${ngpu:-1}"
+
+        validate_ngpu "$ngpu" || {
+          err "--ngpu expects a positive integer"
+          exit 1
+        }
+      fi
+
+      if [[ -n "$array_range" ]]; then
+        submit_array \
+          "$node_arg" "$input_dir" "$run_script" "$output_dir" \
+          "$keep" "$wait_seconds" "$array_range" "$exclude_list" \
+          "$gpu_wanted" "$ngpu"
+      else
+        submit_one_job \
+          "$node_arg" "$input_dir" "$run_script" "$output_dir" \
+          "$keep" "$detach" "$wait_seconds" "-" "-" "-" \
+          "$exclude_list" "$gpu_wanted" "$ngpu"
+      fi
+      ;;
+
+    help|--help|-h)
+      usage
+      ;;
+
+    *)
+      err "Unknown command: $cmd"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
