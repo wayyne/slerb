@@ -1,5 +1,5 @@
 ```text
-_            _             _            _           _        
+        _            _             _            _           _        
        / /\         _\ \          /\ \         /\ \        / /\      
       / /  \       /\__ \        /  \ \       /  \ \      / /  \     
      / / /\ \__   / /_ \_\      / /\ \ \     / /\ \ \    / / /\ \    
@@ -10,6 +10,8 @@ _            _             _            _           _
 /_/\__/ / /  / /_/_/ ___/\ / / /______  / / /\ \ \  / / /____\_\ \   
 \ \/___/ /  /_______/\__\// / /_______\/ / /  \ \ \/ / /__________\  
  \_____\/   \_______\/    \/__________/\/_/    \_\/\/_____________/
+
+                                 written by: Guy W. Dayhoff II, Ph.D.
 ```                                                                    
 
 **SSH-Launched Execution Resource Broker** — a lightweight Bash-based GPU job launcher for small groups of Linux workstations and servers.
