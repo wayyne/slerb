@@ -1,5 +1,18 @@
 # SLERB
 
+        _            _             _            _           _        
+       / /\         _\ \          /\ \         /\ \        / /\      
+      / /  \       /\__ \        /  \ \       /  \ \      / /  \     
+     / / /\ \__   / /_ \_\      / /\ \ \     / /\ \ \    / / /\ \    
+    / / /\ \___\ / / /\/_/     / / /\ \_\   / / /\ \_\  / / /\ \ \   
+    \ \ \ \/___// / /         / /_/_ \/_/  / / /_/ / / / / /\ \_\ \  
+     \ \ \     / / /         / /____/\    / / /__\/ / / / /\ \ \___\ 
+ _    \ \ \   / / / ____    / /\____\/   / / /_____/ / / /  \ \ \__/ 
+/_/\__/ / /  / /_/_/ ___/\ / / /______  / / /\ \ \  / / /____\_\ \   
+\ \/___/ /  /_______/\__\// / /_______\/ / /  \ \ \/ / /__________\  
+ \_____\/   \_______\/    \/__________/\/_/    \_\/\/_____________/  
+                                                                     
+
 **SSH-Launched Execution Resource Broker** — a lightweight Bash-based GPU job launcher for small groups of Linux workstations and servers.
 
 SLERB provides a practical subset of cluster-scheduler behavior without requiring a central daemon, database, or full SLURM installation. It discovers available NVIDIA GPUs over SSH, stages job inputs with `rsync`, protects allocations with atomic lock directories, launches foreground or detached jobs, queues work when resources are unavailable, and retrieves results to the submitting machine.
